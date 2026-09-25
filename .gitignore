@@ -1,0 +1,22 @@
+# Datasets and downloaded assets
+data/
+clip-vit-base-patch32/
+
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+src/baselines/**/runs/
+
+# Logs and generated visualizations
+*.log
+visualizations/
+
+# Python and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
