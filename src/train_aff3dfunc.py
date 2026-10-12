@@ -108,4 +108,4 @@ def train_aff3dfunc_from_scratch(data_path, epochs=3000, device="cuda"):
     print("✅ Aff3DFunc 从零训练完成！权重已保存至 ./data/baselines/aff3dfunc_weights.pth")
 
 if __name__ == "__main__":
-    train_aff3dfunc_from_scratch("./data")
+    raise SystemExit("Legacy entry point disabled: proxy/random-data or unverified evaluation. Use src/train.py or src/evaluate.py. Official baselines require separate verified adapters.")

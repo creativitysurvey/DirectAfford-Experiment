@@ -119,5 +119,4 @@ def run_real_pointbert(data_dir, weight_path, device="cuda", num_samples=150):
     print("✨ 因为缺乏图文联合对齐，这就是单模态 3D 霸主面对文本指令的真实物理极限！")
 
 if __name__ == "__main__":
-    weight_path = "./data/baselines/pointbert_official.pth"
-    run_real_pointbert("./data/laso_dataset", weight_path, num_samples=999999)
+    raise SystemExit("Legacy entry point disabled: proxy/random-data or unverified evaluation. Use src/train.py or src/evaluate.py. Official baselines require separate verified adapters.")

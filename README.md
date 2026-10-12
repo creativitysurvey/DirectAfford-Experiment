@@ -1,124 +1,93 @@
 # DirectAfford-Experiment
 
-代码与实验整理仓库。该仓库当前为私有仓库，包含 DirectAfford、LASO/OpenAD/PointBERT 相关代码和实验脚本。
+公开的 DirectAfford 代码与实验整理仓库。当前提供统一的真实数据训练与评估入口，尚未完成真实数据重训，也没有提供可核验的官方基线对比结果。
 
-> **复现状态说明（请先读）**：仓库目前没有附带数据集或模型权重。现有训练代码、数据格式和启动脚本之间存在不一致，因此下面给出的是环境准备、数据来源和代码当前实际输入要求；不能据此认为所有论文实验已经在干净环境中端到端复现。请按本文核对数据后再启动训练。
+## 本次修复
 
-## 目录概览
+- `src/train.py` 实际解析数据路径、epoch、随机种子、损失和输出目录。
+- 优化器更新几何编码器及预测头，冻结文本编码器并保持其 eval 状态。
+- 保留原始正样本对齐损失 `alignment`（默认）。新增 `bce` 和 `alignment_bce` 是背景监督实验变体，不能直接宣称为原论文方法。
+- 每轮完整验证，以验证 MAE 保存 `best.pth`；`last.pth` 包含优化器、配置、数据哈希、历史和随机状态，可恢复训练。
+- 新评估入口强制严格加载权重、保留全部标注，报告 pooled 与 macro AUC/MAE。单类样本 AUC 为 null，仍计算 MAE。
+- 旧 `eval*.py`、模拟数据基线训练脚本的命令行入口已停用。其定义保留用于审计，不是经过核验的实验 API。不要直接调用这些旧函数生成论文结果。
 
-- `src/`：模型、数据集、训练和评估代码。
-- `src/baselines/`：基线实现。
-- `environment.yml`：Conda 环境依赖。
-- `download_clip.py`：下载 CLIP 文本编码器。
-- `download_openshape.py`：从 Hugging Face 下载 OpenShape Point-BERT 权重。
-- `run_laso_training.sh`、`start_exp2_training.sh`：实验启动脚本；目前参数和所引用脚本与仓库代码并不完全匹配，见“已知复现限制”。
-
-## 环境安装
-
-建议使用 Linux、Python 3.10 和支持 CUDA 的 NVIDIA GPU。仓库环境文件指定 PyTorch 2.0.1 / CUDA 11.8：
+## 环境
 
 ```bash
-git clone git@github.com:creativitysurvey/DirectAfford-Experiment.git
-cd DirectAfford-Experiment
-
 conda env create -f environment.yml
 conda activate directafford_env
-
-python - <<'PY'
-import torch
-print("torch:", torch.__version__)
-print("CUDA available:", torch.cuda.is_available())
-if torch.cuda.is_available():
-    print("GPU:", torch.cuda.get_device_name(0))
-PY
 ```
 
-若只做 CPU 测试，数据预处理和模型运行仍可能很慢；正式训练建议使用 CUDA GPU。
+Linux、Python 3.10、PyTorch 2.0.1/CUDA 11.8 是原环境配置。本次离线语义测试使用 CPU PyTorch；原 CUDA 环境尚未实测。CLIP 通过 `--text-encoder` 指定本地目录或模型标识，默认 `openai/clip-vit-base-patch32`。模型使用冻结的 `CLIPTextModel.pooler_output`，并非官方 CLIP 投影后的跨模态特征；与其他模型对比时需要明确这一点。
 
-## 数据获取与目录
+## LASO 输入
 
-### LASO 数据集
+LASO 官方来源：[yl3800/LASO](https://github.com/yl3800/LASO)。遵守发布方许可，pickle 和模型权重只从可信来源加载。
 
-LASO 官方代码仓库提供数据集下载说明和 Google Drive 链接：
-
-- 官方代码与说明：[yl3800/LASO](https://github.com/yl3800/LASO)
-- 官方数据集下载：[Google Drive](https://drive.google.com/file/d/1P4CwQeSALtUOgzhg1ILCiKovE-tcXlSu/view)
-
-请遵循数据集发布方的许可条款。下载后解压到本地，不要提交到 Git。当前仓库的 LASO 数据扫描脚本读取：
+本仓库已对照 [LASO 官方数据加载器](https://github.com/yl3800/LASO/blob/main/data_utils/shapenetpart.py) 实现 query 和坐标处理，支持以下**明确的数据合同**；尚未用官方数据包验证，不保证原始 pickle 可直接读取。若格式不同，请先按官方字段转换，禁止用随机数据、全零点云或任意 mask 补缺。
 
 ```text
-data/laso_dataset/LASO_dataset/anno_val.pkl
+data/laso_dataset/LASO_dataset/
+  anno_train.pkl       objects_train.pkl
+  anno_val.pkl         objects_val.pkl
+  anno_test.pkl        objects_test.pkl
+  Affordance-Question.csv
 ```
 
-训练与评估代码对 LASO 的目录/文件名要求并不统一，运行前应先检查对应脚本的参数和数据读取逻辑。
+- `anno_<split>.pkl`：list 或 dict 的 value 列表。每条含 `shape_id`、`affordance`（非空字符串或单元素字符串列表）、`mask`（长度 N 的 [0,1] 数组，或以完整 query 为键的字典）。多 query 标注须明确展开。
+- `objects_<split>.pkl`：以 shape ID 为键的 dict，或每条带 `shape_id` 的 list；每个对象是坐标数组或只含一个坐标字段 `point_cloud` / `points` / `coordinate` 的字典。
+- 官方 query 模式（默认）要求标注含 `class`，并按 CSV 的 `Object`/`Affordance` 精确匹配。训练使用 Question1–14 的随机改写，验证/测试使用 Question0；不再把 affordance 类名当成情境问题。`--laso-query-mode affordance` 仅供类名消融，不能称为官方 LASO 查询协议。
+- 坐标为 `(N, >=3)`，取前三列；点与 mask 必须等长且有限。缺失 shape、歧义 query/mask、空点云立即报错。
+- 训练、验证、测试 shape 必须互不重叠；独立测试入口检查训练和验证 shape ID。采样索引按 seed + 标注序号固定，点和 mask 同步；短点云保留原点并重复补足。LASO 坐标按官方流程中心化并缩放到单位球，退化点云报错。full-shape 坐标流程保持原样。不同预处理的基线不可直接混比。
 
-### DirectAfford full-shape 数据
+## 真实数据训练与独立评估
 
-仓库中的 `src/dataset.py` 和 `src/train.py` 实际读取以下 pickle 文件：
-
-```text
-data/full_shape_train_data.pkl
-data/full_shape_val_data.pkl
-```
-
-每个样本至少需要包含 `full_shape`（含 `coordinate` 与按 affordance 标注的 `label`）和 `affordance` 字段。当前仓库没有给出这两个文件的公开下载链接、生成脚本或完整数据转换流程。若你没有从项目原始数据来源获得这两个文件，仅下载 LASO 并不能直接满足该训练入口的输入要求。不要把这些数据文件上传到 GitHub；请在取得授权后通过合适的数据托管服务分享，并在此处补充固定版本和校验和。
-
-## 预训练权重获取
-
-### CLIP 文本编码器
-
-模型默认使用 Hugging Face 上的 `openai/clip-vit-base-patch32`。可按需下载到仓库根目录的 `clip-vit-base-patch32/`：
+先检查数据合同，再分别运行原始损失和背景监督变体。输出目录应独立，正式建议种子 42、43、44 分别重训。
 
 ```bash
-python download_clip.py
+python src/train.py --dataset laso --data-dir data/laso_dataset \
+  --epochs 300 --seed 42 --loss alignment --output-dir outputs/alignment_seed42
+
+python src/train.py --dataset laso --data-dir data/laso_dataset \
+  --epochs 300 --seed 42 --loss alignment_bce --output-dir outputs/alignment_bce_seed42
+
+python src/train.py --dataset laso --data-dir data/laso_dataset \
+  --epochs 300 --seed 42 --loss alignment_bce --output-dir outputs/alignment_bce_seed42 \
+  --resume outputs/alignment_bce_seed42/last.pth
+
+python src/evaluate.py --checkpoint outputs/alignment_bce_seed42/best.pth \
+  --data-dir data/laso_dataset --split test --output-dir outputs/eval_seed42
 ```
 
-也可以让 Transformers 在首次运行时从 Hugging Face 下载。离线环境需先在可联网机器下载模型，再按 Transformers 缓存或本地目录方式传入。
+300 epoch 是启动默认值，不是经过验证的最优配置。脚本前台执行并输出每轮指标，后台运行请显式使用 `nohup`。`bash start_exp2_training.sh --loss alignment_bce` 仅训练 DirectAfford，不启动未经核验的基线。
 
-### OpenShape Point-BERT 权重（可选）
+新入口要求带配置和优化器状态的新格式 checkpoint；旧的纯 state_dict 不能自动续跑或直接进入新评估，应重新训练。
 
-`download_openshape.py` 会下载 Hugging Face 仓库 `OpenShape/openshape-pointbert-shapenet` 的 `model.pt`，并保存为 `data/pointbert.pt`：
+输出：`run.json`（配置及数据哈希）、`history.json`、`best.pth`、`last.pth`；评估输出 `metrics.json`、`per_sample.json`、`predictions.npz`。测试集不能用于选择损失、epoch 或温度；这些选择只在验证集完成。
+
+## full-shape / 3D AffordanceNet
+
+兼容已有 `full_shape_train_data.pkl` / `full_shape_val_data.pkl` 与三折类别协议：
 
 ```bash
-python -m pip install huggingface_hub
-python download_openshape.py
+python src/train.py --dataset full_shape --data-dir data --fold 0 \
+  --loss alignment --epochs 300 --output-dir outputs/fullshape_fold0
+python src/evaluate.py --checkpoint outputs/fullshape_fold0/best.pth \
+  --data-dir data --split val --classes novel --output-dir outputs/fullshape_novel_fold0
 ```
 
-此文件是 OpenShape 预训练权重，不是本仓库训练得到的 DirectAfford checkpoint。使用前请确认对应评估/基线脚本确实读取该路径。
+训练 checkpoint 的选优只使用 val 文件中的 seen 类；novel 类评估单独执行。此仓库没有提供 full-shape 文件的下载或生成流程。需要额外核对训练/验证对象来源与独立性，不能把此协议当作 LASO 原始情境查询协议。
 
-### DirectAfford 训练权重
+## 基线与旧表格的限制
 
-训练入口将模型权重写到 `data/directafford_weights.pth`。仓库未提供该权重的下载地址；需使用兼容的数据运行训练获得。训练输出和 checkpoint 已被 `.gitignore` 排除。
+现存 OpenAD、Aff3DFunc 训练函数使用随机演示数据，若旧权重由这些函数生成，不能称为真实数据训练权重。部分旧评估使用代理结构、随机输入、缺失权重继续运行或 `strict=False`。已有截图数值无法仅凭仓库定位其生成脚本，不能据此认定为真实官方对比。
 
-## 当前代码的 DirectAfford 训练入口
+`src/baselines/` 中三个 gitlink 缺少 `.gitmodules`，普通 clone 不会取得官方源码。当前没有擅自补猜测 URL；需核验原始 URL 与固定 commit，再恢复子模块和官方模型适配器。Point-BERT、OpenAD、LASO、Aff3DFunc 的正式对比仍需使用各自已核验的官方实现、兼容权重和同一测试协议。新入口目前只评估 DirectAfford，不生成这些方法的占位分数。
 
-在仓库根目录先准备好上述两个 `full_shape_*.pkl` 文件以及 CLIP 权重，再执行：
+## 本地验证
 
 ```bash
-python src/train.py
+python -m unittest discover -s tests -v
 ```
 
-当前 `src/train.py` 不解析命令行参数；它默认读取 `./data/full_shape_train_data.pkl` 和 `./data/full_shape_val_data.pkl` 所在的 `data/` 目录，使用 fold 0、2048 点、batch size 16，并训练 3 个 epoch。权重保存到 `data/directafford_weights.pth`。这些参数是代码当前默认值，不代表论文配置已经完整核验。
-
-LASO 相关的评估脚本位于 `src/eval*.py`。每个脚本使用的数据路径、checkpoint 路径和参数可能不同，运行前请查看其顶部配置和命令行参数，并将数据与权重路径设置为本机实际位置。
-
-## 已知复现限制
-
-- `run_laso_training.sh` 调用 `src/train_laso.py` 和 `src/train_pointbert.py`，但这两个入口并未出现在仓库当前文件清单中；该脚本也把 LASO 路径设为 `./data/laso`。不能直接视为可运行的完整训练流程。
-- `start_exp2_training.sh` 向训练脚本传递 `--data_dir` 和 `--epochs`，而仓库当前 `src/train.py` 不解析这些参数；它不能按脚本说明可靠地启动训练。
-- LASO 原始数据与 `src/dataset.py` 需要的 `full_shape_*.pkl` 是不同的数据格式。仓库尚未包含从官方 LASO 数据到此格式的完整转换说明。
-- 首次运行前，请先在小规模数据上核验数据字段、模型前向和保存路径，再启动长时间训练；记录实际 commit、配置、随机种子、数据版本和权重哈希，便于复核结果。
-
-## 引用
-
-若使用 LASO 数据集或其基线，请引用 LASO 原论文，并遵循官方仓库中列出的引用与许可要求：
-
-```bibtex
-@InProceedings{Li_2024_CVPR,
-  author    = {Li, Yicong and Zhao, Na and Xiao, Junbin and Feng, Chun and Wang, Xiang and Chua, Tat-Seng},
-  title     = {LASO: Language-guided Affordance Segmentation on 3D Object},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  year      = {2024},
-  pages     = {14251--14260}
-}
-```
+测试用固定的文本编码器替代 CLIP 下载，使用小型合成数据核验点/mask 配对、缺失数据报错、背景梯度、预测头更新、冻结文本、官方问题选择与坐标归一化、评估确定性、训练续跑及输出完整性。它们不验证真实 CLIP 语义、真实数据效果或 GPU 性能。

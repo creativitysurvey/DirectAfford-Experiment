@@ -223,4 +223,4 @@ def run_hardcore_evaluation(data_dir, device="cuda", num_samples=50):
     print("=" * 70)
 
 if __name__ == "__main__":
-    run_hardcore_evaluation("./data/laso_dataset", device="cuda" if torch.cuda.is_available() else "cpu", num_samples=50)
+    raise SystemExit("Legacy entry point disabled: proxy/random-data or unverified evaluation. Use src/train.py or src/evaluate.py. Official baselines require separate verified adapters.")

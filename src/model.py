@@ -11,12 +11,13 @@ def square_distance(src, dst):
     dist += torch.sum(dst ** 2, -1).view(B, 1, M)
     return dist
 
-def fps(xyz, npoint):
+def fps(xyz, npoint, random_start=True):
     device = xyz.device
     B, N, C = xyz.shape
     centroids = torch.zeros(B, npoint, dtype=torch.long, device=device)
     distance = torch.ones(B, N, device=device) * 1e10
-    farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
+    farthest = (torch.randint(0, N, (B,), dtype=torch.long, device=device) if random_start
+                else torch.zeros(B, dtype=torch.long, device=device))
     batch_indices = torch.arange(B, dtype=torch.long, device=device)
     for i in range(npoint):
         centroids[:, i] = farthest
@@ -58,7 +59,9 @@ class AttentionEnhancedGeometricEncoder(nn.Module):
 
     def forward(self, xyz):
         B, N, _ = xyz.shape
-        center_idx = fps(xyz, self.num_patches)
+        if N < max(self.num_patches, self.k_neighbors):
+            raise ValueError("Too few points for configured patches/neighbors")
+        center_idx = fps(xyz, self.num_patches, random_start=self.training)
         centers = index_points(xyz, center_idx)
         sq_dist = square_distance(centers, xyz)
         knn_idx = sq_dist.topk(self.k_neighbors, dim=-1, largest=False)[1]
@@ -98,6 +101,11 @@ class DirectAffordModel(nn.Module):
             nn.GELU(),
             nn.Linear(512, self.text_dim)
         )
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.text_encoder.eval()
+        return self
 
     def get_text_embeddings(self, text_queries, device):
         with torch.no_grad():

@@ -47,7 +47,7 @@ def farthest_point_sample(xyz, npoint):
 
 
 class AffordanceNetKFoldDataset(Dataset):
-    def __init__(self, data_dir, fold_id=0, split="train", num_points=2048):
+    def __init__(self, data_dir, fold_id=0, split="train", num_points=2048, class_mode=None):
         if split not in {"train", "val"}:
             raise ValueError("split must be 'train' or 'val'")
         if not 0 <= fold_id < 3:
@@ -68,6 +68,12 @@ class AffordanceNetKFoldDataset(Dataset):
             if split == "train"
             else novel_classes
         )
+
+        if class_mode is not None:
+            if class_mode not in {"seen", "novel"}:
+                raise ValueError("class_mode must be seen or novel")
+            self.target_classes = ([c for c in ALL_CLASSES if c not in novel_classes]
+                                   if class_mode == "seen" else novel_classes)
 
         self.valid_data = []
         self.skipped_missing_mask = 0
@@ -134,16 +140,7 @@ class AffordanceNetKFoldDataset(Dataset):
             )
         raw_points = raw_points[:, :3]
 
-        if len(raw_points) > self.num_points:
-            fps_idx = farthest_point_sample(raw_points, self.num_points)
-            sampled_points = raw_points[fps_idx, :]
-            sampled_mask = raw_mask[fps_idx]
-        elif len(raw_points) < self.num_points:
-            pad_idx = np.random.choice(len(raw_points), self.num_points, replace=True)
-            sampled_points = raw_points[pad_idx, :]
-            sampled_mask = raw_mask[pad_idx]
-        else:
-            sampled_points = raw_points
-            sampled_mask = raw_mask
-
+        from real_data import sample_points
+        rng = np.random.default_rng(idx) if self.split != "train" else np.random.default_rng(np.random.randint(2**31))
+        sampled_points, sampled_mask = sample_points(raw_points, raw_mask, self.num_points, rng)
         return torch.tensor(sampled_points), torch.tensor(sampled_mask), text_query

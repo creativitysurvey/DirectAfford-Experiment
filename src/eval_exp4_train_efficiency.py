@@ -91,4 +91,4 @@ def run_train_profiling():
     print("=" * 75)
 
 if __name__ == "__main__":
-    run_train_profiling()
+    raise SystemExit("Legacy entry point disabled: proxy/random-data or unverified evaluation. Use src/train.py or src/evaluate.py. Official baselines require separate verified adapters.")

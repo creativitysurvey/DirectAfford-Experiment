@@ -80,4 +80,4 @@ def train_kdtpc_from_scratch(data_path, epochs=3000, device="cuda"):
     print("✅ KD-TPC 从零训练完成！权重已保存至 ./data/baselines/kdtpc_weights.pth")
 
 if __name__ == "__main__":
-    train_kdtpc_from_scratch("./data")
+    raise SystemExit("Legacy entry point disabled: proxy/random-data or unverified evaluation. Use src/train.py or src/evaluate.py. Official baselines require separate verified adapters.")

@@ -28,6 +28,19 @@ def direct_predictive_alignment_loss(predicted_point_embeddings, target_text_emb
     
     # 防御机制：如果整个 Batch 没有激活点，返回 0 梯度
     if active_mask.sum() == 0:
-        return torch.tensor(0.0, device=predicted_point_embeddings.device, requires_grad=True)
+        return predicted_point_embeddings.sum() * 0.0
         
     return loss_batch.mean()
+
+
+
+def dense_alignment_loss(predicted, target, masks, mode="alignment_bce", scale=10.0):
+    """Optional background-supervised variant; not the original paper objective."""
+    if mode not in {"alignment", "bce", "alignment_bce"}:
+        raise ValueError("Unknown loss mode")
+    alignment = direct_predictive_alignment_loss(predicted, target, masks)
+    if mode == "alignment":
+        return alignment
+    logits = (predicted * target.unsqueeze(1)).sum(-1) * scale
+    bce = F.binary_cross_entropy_with_logits(logits, masks.reshape_as(logits))
+    return bce if mode == "bce" else alignment + bce

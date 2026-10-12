@@ -126,5 +126,4 @@ def run_real_openad(data_dir, weight_path, device="cuda", num_samples=50):
     print("✨ 这就是它在最复杂场景下真实的物理底线！")
 
 if __name__ == "__main__":
-    weight_path = "./data/baselines/openad_official.pth"
-    run_real_openad("./data/laso_dataset", weight_path, num_samples=9)
+    raise SystemExit("Legacy entry point disabled: proxy/random-data or unverified evaluation. Use src/train.py or src/evaluate.py. Official baselines require separate verified adapters.")

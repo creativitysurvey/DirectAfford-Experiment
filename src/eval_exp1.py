@@ -77,9 +77,4 @@ def run_experiment_1(model, data_path, device="cuda"):
     print("=============================================")
 
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = DirectAffordModel(text_encoder_name="openai/clip-vit-base-patch32").to(device)
-    weights_path = "./data/directafford_weights.pth"
-    if os.path.exists(weights_path):
-        model.load_state_dict(torch.load(weights_path, map_location=device))
-    run_experiment_1(model, "./data", device)
+    raise SystemExit("Legacy entry point disabled: proxy/random-data or unverified evaluation. Use src/train.py or src/evaluate.py. Official baselines require separate verified adapters.")

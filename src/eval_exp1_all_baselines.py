@@ -150,4 +150,4 @@ def run_comparative_experiment(data_path, device="cuda"):
     print("=" * 70)
 
 if __name__ == "__main__":
-    run_comparative_experiment("./data", device="cuda" if torch.cuda.is_available() else "cpu")
+    raise SystemExit("Legacy entry point disabled: proxy/random-data or unverified evaluation. Use src/train.py or src/evaluate.py. Official baselines require separate verified adapters.")

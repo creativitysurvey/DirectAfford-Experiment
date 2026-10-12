@@ -20,3 +20,8 @@ __pycache__/
 .venv/
 venv/
 .env
+
+
+# Reproducible run artifacts contain local data/checkpoints, not source
+outputs/
+__pycache__/

@@ -131,4 +131,4 @@ def run_proxy_laso(data_dir, device="cuda", num_samples=150):
     print("✨ 因为全局 Cross-Attention 会导致局部空间特征的过度平滑，这就是它的宿命底线！")
 
 if __name__ == "__main__":
-    run_proxy_laso("./data/laso_dataset", num_samples=999999)
+    raise SystemExit("Legacy entry point disabled: proxy/random-data or unverified evaluation. Use src/train.py or src/evaluate.py. Official baselines require separate verified adapters.")
