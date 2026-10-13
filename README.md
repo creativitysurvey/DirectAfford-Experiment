@@ -1,13 +1,13 @@
 # DirectAfford-Experiment
 
-公开的 DirectAfford 代码与实验整理仓库。当前提供统一的真实数据训练与评估入口，尚未完成真实数据重训，也没有提供可核验的官方基线对比结果。
+公开的 DirectAfford 代码与实验整理仓库。当前提供统一的真实数据训练与评估入口，完整真实数据重训及官方基线对比核验尚未完成。
 
 ## 本次修复
 
 - `src/train.py` 实际解析数据路径、epoch、随机种子、损失和输出目录。
 - 优化器更新几何编码器及预测头，冻结文本编码器并保持其 eval 状态。
 - 保留原始正样本对齐损失 `alignment`（默认）。新增 `bce` 和 `alignment_bce` 是背景监督实验变体，不能直接宣称为原论文方法。
-- 每轮完整验证，以验证 MAE 保存 `best.pth`；`last.pth` 包含优化器、配置、数据哈希、历史和随机状态，可恢复训练。
+- 每轮完整验证，默认以验证 MAE 保存 `best.pth`，可用 `--selection` 显式改变主选优指标；`last.pth` 包含优化器、配置、数据哈希、历史和随机状态，可恢复训练。
 - 新评估入口强制严格加载权重、保留全部标注，报告 pooled 与 macro AUC/MAE。单类样本 AUC 为 null，仍计算 MAE。
 - 旧 `eval*.py`、模拟数据基线训练脚本的命令行入口已停用。其定义保留用于审计，不是经过核验的实验 API。不要直接调用这些旧函数生成论文结果。
 
@@ -18,7 +18,7 @@ conda env create -f environment.yml
 conda activate directafford_env
 ```
 
-Linux、Python 3.10、PyTorch 2.0.1/CUDA 11.8 是原环境配置。本次离线语义测试使用 CPU PyTorch；原 CUDA 环境尚未实测。CLIP 通过 `--text-encoder` 指定本地目录或模型标识，默认 `openai/clip-vit-base-patch32`。模型使用冻结的 `CLIPTextModel.pooler_output`，并非官方 CLIP 投影后的跨模态特征；与其他模型对比时需要明确这一点。
+Linux、Python 3.10、PyTorch 2.0.1/CUDA 11.8 是原环境配置。离线语义测试使用 CPU PyTorch；node107 的 PyTorch 2.0.1/CUDA 环境已完成真实数据单轮试跑，完整正式实验仍在进行。CLIP 通过 `--text-encoder` 指定本地目录或模型标识，默认 `openai/clip-vit-base-patch32`。模型使用冻结的 `CLIPTextModel.pooler_output`，并非官方 CLIP 投影后的跨模态特征；与其他模型对比时需要明确这一点。
 
 ## LASO 输入
 
@@ -110,3 +110,41 @@ python -m unittest discover -s tests -v
 ```
 
 Passing the offline tests does not establish real-data accuracy. If the bridge still fails with NumPy 1.26.4, inspect the actual imported package paths and PyTorch installation before training.
+
+
+## 双指标优化与配对筛选
+
+目标是同一个 checkpoint 同时达到独立测试 AUC > 0.871、MAE < 0.089。阈值是优化目标，不是实测结果；旧表格的来源和评估协议仍待核验。开发只读取训练和验证数据，不在测试集上调参。
+
+- 每轮分别保存 `best_auc.pth`、`best_mae.pth`、`best_joint.pth`。同一模型的指标成对记录，不拼接不同 epoch 的最佳数值。
+- joint 分数为 `max(0,0.871-AUC)/0.871 + max(0,MAE-0.089)/0.089`。这是预先指定的折中选优规则，不能保证达标。达到目标时分数为0；严格是否超过目标由 `validation_targets_met` 单独报告。
+- `best_feasible_auc.pth` 仅在验证 MAE < 0.089 时保存其中 AUC 最大的模型；文件存在不代表 AUC 已 > 0.871。
+- `--alignment-weight` 和 `--bce-weight` 可控制组合损失；默认均为1，保持原配置。原始 alignment、纯 BCE、组合损失是不同实验设置。
+- 每轮记录 alignment/BCE 分项、pooled 和 macro AUC、标签与预测均值、前景/背景平均预测值、学习率与耗时。每100 batch输出进度。
+- `--scheduler plateau` 根据验证 AUC 停滞减半学习率；`--early-stop-patience` 默认为0（关闭），启用后依据 `--selection` 指标决定停止。
+- 每个输出目录使用 Linux 文件锁，防止新版训练进程重复写入。旧版运行中的进程不持有这个锁，因此必须使用新目录。
+- 旧 checkpoint 可在旧配置默认值下续跑，但无法恢复历史 AUC 最优模型。更换损失权重、scheduler 或选优配置需要另起独立训练，不改写正在运行的旧实验。
+
+### Node107 四组50轮筛选
+
+在GPU 1可用时执行；保留GPU 0上的旧任务。四组从同一种子42初始化、相同50轮预算、相同 plateau 调度，并按固定 joint 规则保存候选：
+原始 alignment、纯 BCE、0.1×alignment+BCE、alignment+BCE。这一阶段是单种子验证筛选，胜出配置之后仍需要种子43、44复核。
+
+```bash
+cd /data/liwei/DirectAfford-Experiment
+conda activate directafford_env
+git pull --ff-only
+export PYTHONNOUSERSITE=1
+python -m unittest discover -s tests -v
+
+DIRECTAFFORD_SCREEN="outputs/loss_screen_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$DIRECTAFFORD_SCREEN"
+nohup python -u scripts/run_loss_screen.py --gpu 1 --epochs 50 --seed 42 \
+  --data-dir data/laso_dataset --output-root "$DIRECTAFFORD_SCREEN" \
+  > "$DIRECTAFFORD_SCREEN/screen.log" 2>&1 &
+echo "$DIRECTAFFORD_SCREEN"
+```
+
+脚本顺序执行四组，每组单独保存日志/权重，最后生成 `screen_summary.json`。重启时使用同一个 output-root 自动跳过已完成组并恢复未完成组；修改预算、种子、代码或数据路径必须用新根目录。第二次启动同一筛选根目录会被锁拒绝。测试集不参与筛选。
+
+评估胜出配置之前冻结配置和选择规则，并补齐三种子重复；正式对比需统一测试样本、查询、归一化、点采样和 AUC 汇总方式。任何阈值是否达成最终以该冻结协议下的独立测试结果为准。

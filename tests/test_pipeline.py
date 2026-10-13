@@ -49,7 +49,8 @@ class TextModel(torch.nn.Module):
 # Stub only the external text dependency; exercise actual geometry/head/loss.
 sys.modules['transformers'] = types.SimpleNamespace(CLIPTextModel=TextModel, CLIPTokenizer=Tokenizer)
 from model import DirectAffordModel, AttentionEnhancedGeometricEncoder
-from loss import dense_alignment_loss
+from loss import dense_alignment_loss, loss_components
+from selection import CheckpointSelection
 from metrics import compute_metrics
 from real_data import LASORealDataset, sample_points
 import train
@@ -72,6 +73,54 @@ def fixture(base, split, offset=0):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_joint_selection_does_not_splice_metrics(self):
+        selector=CheckpointSelection()
+        selector.update(dict(auc=0.90,mae=0.15))
+        result=selector.update(dict(auc=0.84,mae=0.08))
+        self.assertTrue(result["feasible_auc"])
+        self.assertEqual(selector.best_feasible_auc,0.84)
+        # Neither checkpoint passes BOTH strict goals.
+        result=selector.update(dict(auc=0.88,mae=0.085))
+        self.assertTrue(result["joint"])
+        self.assertEqual(selector.best_joint,0)
+        self.assertFalse(selector.update(dict(auc=None,mae=0.2))["auc"])
+
+    def test_screen_completion_and_no_test_reads(self):
+        spec=importlib.util.spec_from_file_location('loss_screen',Path(__file__).resolve().parents[1]/'scripts/run_loss_screen.py')
+        screen=importlib.util.module_from_spec(spec); spec.loader.exec_module(screen)
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d); data=base/'data'; out=base/'screen'
+            fixture(data,'train'); fixture(data,'val',10)
+            (data/'Affordance-Question.csv').write_text('Object,Affordance,Question0\n')
+            calls=[]
+            def fake_run(command,**kwargs):
+                calls.append(command)
+                child=Path(command[command.index('--output-dir')+1])
+                (child/'history.json').write_text(json.dumps([dict(epoch=1,auc=0.88,mae=0.085)]))
+            argv=['run_loss_screen.py','--data-dir',str(data),'--output-root',str(out),'--epochs','1']
+            with patch.object(screen.subprocess,'run',fake_run),patch.object(sys,'argv',argv):
+                screen.main(); screen.main()
+            self.assertEqual(len(calls),4)  # completed jobs are not relaunched
+            self.assertFalse((data/'anno_test.pkl').exists())
+            summary=json.loads((out/'screen_summary.json').read_text())
+            self.assertTrue(all(r['both_validation_targets_met'] for r in summary))
+
+    def test_duplicate_run_lock(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as d:
+            with open(Path(d)/'run.lock','a') as handle:
+                fcntl.flock(handle.fileno(),fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with patch.object(sys,'argv',['train.py','--data-dir',d,'--output-dir',d]):
+                    with self.assertRaises(RuntimeError): train.main()
+
+    def test_weighted_objective(self):
+        p=torch.randn(2,4,3,requires_grad=True); t=torch.randn(2,3)
+        masks=torch.tensor([[0,1]*2]*2).float()
+        a,b=loss_components(p,t,masks)
+        combined=dense_alignment_loss(p,t,masks,alignment_weight=0.1,bce_weight=2)
+        torch.testing.assert_close(combined,0.1*a+2*b)
+        torch.testing.assert_close(dense_alignment_loss(p,t,masks,'bce'),b)
+
     def test_padding_and_pairing(self):
         p = np.arange(6).reshape(2,3)
         m = np.array([0,1])
@@ -138,13 +187,17 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             base=Path(d); data=base/'data'; out=base/'run'
             fixture(data,'train',0); fixture(data,'val',10); fixture(data,'test',20)
-            common=['train.py','--laso-query-mode','affordance','--data-dir',str(data),'--num-points','8','--batch-size','2','--device','cpu','--loss','bce','--output-dir',str(out)]
+            common=['train.py','--laso-query-mode','affordance','--data-dir',str(data),'--num-points','8','--batch-size','2','--device','cpu','--loss','bce','--scheduler','plateau','--lr-patience','0','--selection','joint','--output-dir',str(out)]
             with patch.object(train,'DirectAffordModel',small_model), patch.object(sys,'argv',common+['--epochs','1']): train.main()
-            with patch.object(train,'DirectAffordModel',small_model), patch.object(sys,'argv',common+['--epochs','2','--resume',str(out/'last.pth')]): train.main()
+            with patch.object(train,'DirectAffordModel',small_model), patch.object(sys,'argv',common+['--epochs','3','--resume',str(out/'last.pth')]): train.main()
             checkpoint=torch.load(out/'last.pth',weights_only=False)
-            self.assertEqual(checkpoint['epoch'],2)
+            self.assertEqual(checkpoint['epoch'],3)
+            self.assertIn('scheduler',checkpoint)
+            self.assertLess(checkpoint['optimizer']['param_groups'][0]['lr'],1e-4)
+            for name in ('best_auc.pth','best_mae.pth','best_joint.pth'):
+                self.assertTrue((out/name).exists())
             fresh=base/'fresh'
-            fresh_args=[str(fresh) if x==str(out) else x for x in common]+['--epochs','2']
+            fresh_args=[str(fresh) if x==str(out) else x for x in common]+['--epochs','3']
             with patch.object(train,'DirectAffordModel',small_model), patch.object(sys,'argv',fresh_args): train.main()
             reference=torch.load(fresh/'last.pth',weights_only=False)
             for name,tensor in checkpoint['model'].items():

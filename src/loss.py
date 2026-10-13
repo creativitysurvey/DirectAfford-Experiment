@@ -34,13 +34,24 @@ def direct_predictive_alignment_loss(predicted_point_embeddings, target_text_emb
 
 
 
-def dense_alignment_loss(predicted, target, masks, mode="alignment_bce", scale=10.0):
-    """Optional background-supervised variant; not the original paper objective."""
-    if mode not in {"alignment", "bce", "alignment_bce"}:
-        raise ValueError("Unknown loss mode")
+def loss_components(predicted, target, masks, scale=10.0):
+    """Expose competing positive-alignment and dense segmentation terms."""
     alignment = direct_predictive_alignment_loss(predicted, target, masks)
-    if mode == "alignment":
-        return alignment
     logits = (predicted * target.unsqueeze(1)).sum(-1) * scale
     bce = F.binary_cross_entropy_with_logits(logits, masks.reshape_as(logits))
-    return bce if mode == "bce" else alignment + bce
+    return alignment, bce
+
+
+def dense_alignment_loss(predicted, target, masks, mode="alignment_bce", scale=10.0,
+                         alignment_weight=1.0, bce_weight=1.0):
+    """Optional background-supervised variants; original alignment stays available."""
+    if mode not in {"alignment", "bce", "alignment_bce"}:
+        raise ValueError("Unknown loss mode")
+    if alignment_weight < 0 or bce_weight < 0:
+        raise ValueError("Loss weights must be nonnegative")
+    alignment, bce = loss_components(predicted, target, masks, scale)
+    if mode == "alignment":
+        return alignment_weight * alignment
+    if mode == "bce":
+        return bce_weight * bce
+    return alignment_weight * alignment + bce_weight * bce
