@@ -10,7 +10,8 @@ dependencies:
   - torchvision=0.15.2
   - torchaudio=2.0.2
   - pytorch-cuda=11.8
-  - numpy
+  # PyTorch 2.0.1 wheels require the NumPy 1.x ABI.
+  - numpy=1.26.4
   - tqdm
   - scikit-learn
   - pip
