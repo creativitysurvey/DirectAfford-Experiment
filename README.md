@@ -91,3 +91,22 @@ python -m unittest discover -s tests -v
 ```
 
 测试用固定的文本编码器替代 CLIP 下载，使用小型合成数据核验点/mask 配对、缺失数据报错、背景梯度、预测头更新、冻结文本、官方问题选择与坐标归一化、评估确定性、训练续跑及输出完整性。它们不验证真实 CLIP 语义、真实数据效果或 GPU 性能。
+
+### PyTorch 2.0.1 / NumPy compatibility
+
+The original PyTorch 2.0.1 environment must use NumPy 1.x; `environment.yml` pins NumPy 1.26.4. If DataLoader reports `Could not infer dtype of numpy.float32`, first inspect versions and the NumPy bridge:
+
+```bash
+python -c "import torch, numpy as np; print(torch.__version__, np.__version__); print(torch.from_numpy(np.zeros(2, dtype=np.float32)))"
+```
+
+For an existing environment with NumPy 2.x, repair and rerun in a new Python process:
+
+```bash
+conda activate directafford_env
+python -m pip install --force-reinstall --no-deps "numpy==1.26.4"
+python -m pip check
+python -m unittest discover -s tests -v
+```
+
+Passing the offline tests does not establish real-data accuracy. If the bridge still fails with NumPy 1.26.4, inspect the actual imported package paths and PyTorch installation before training.
