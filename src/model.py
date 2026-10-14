@@ -84,14 +84,17 @@ class AttentionEnhancedGeometricEncoder(nn.Module):
         return dense_features
 
 class DirectAffordModel(nn.Module):
-    def __init__(self, text_encoder_name="openai/clip-vit-base-patch32"):
+    def __init__(self, text_encoder_name="openai/clip-vit-base-patch32", architecture="legacy"):
+        if architecture not in {"legacy", "local", "query_local"}:
+            raise ValueError("Unknown architecture")
         super().__init__()
+        self.architecture = architecture
         self.tokenizer = CLIPTokenizer.from_pretrained(text_encoder_name)
         self.text_encoder = CLIPTextModel.from_pretrained(text_encoder_name)
         for param in self.text_encoder.parameters():
             param.requires_grad = False
             
-        self.text_dim = self.text_encoder.config.projection_dim if hasattr(self.text_encoder.config, 'projection_dim') else 512
+        self.text_dim = getattr(self.text_encoder.config, "hidden_size", getattr(self.text_encoder.config, "projection_dim", 512))
         self.geom_dim = 384
         
         self.geometric_encoder = AttentionEnhancedGeometricEncoder(embed_dim=self.geom_dim)
@@ -101,6 +104,17 @@ class DirectAffordModel(nn.Module):
             nn.GELU(),
             nn.Linear(512, self.text_dim)
         )
+
+        if architecture != "legacy":
+            # Point coordinates + neighbor-offset statistics retain details
+            # that are otherwise available only through patch interpolation.
+            self.point_local = nn.Sequential(nn.Linear(12,64),nn.GELU(),nn.Linear(64,64))
+            self.local_fusion = nn.Sequential(nn.Linear(self.geom_dim+64,self.geom_dim),
+                                              nn.LayerNorm(self.geom_dim),nn.GELU())
+        if architecture == "query_local":
+            self.query_film = nn.Linear(self.text_dim,2*self.geom_dim)
+            self.query_head = nn.Sequential(nn.Linear(self.geom_dim,128),nn.GELU(),
+                                             nn.Linear(128,1))
 
     def train(self, mode=True):
         super().train(mode)
@@ -113,7 +127,29 @@ class DirectAffordModel(nn.Module):
             text_features = self.text_encoder(**inputs).pooler_output
             return F.normalize(text_features, p=2, dim=-1)
 
+    def encode_points(self, point_clouds):
+        geom = self.geometric_encoder(point_clouds)
+        if self.architecture == "legacy":
+            return geom
+        # Deterministic KNN descriptors; includes self, shared for all variants.
+        neighbors = min(16,point_clouds.shape[1])
+        distances = square_distance(point_clouds,point_clouds).clamp_min(0)
+        indices = distances.topk(neighbors,dim=-1,largest=False).indices
+        relative = index_points(point_clouds,indices)-point_clouds.unsqueeze(2)
+        descriptors = torch.cat([point_clouds,relative.mean(2),relative.amax(2),relative.amin(2)],dim=-1)
+        local = self.point_local(descriptors)
+        return self.local_fusion(torch.cat([geom,local],dim=-1))
+
     def forward(self, point_clouds):
-        geom_features = self.geometric_encoder(point_clouds)
-        predicted_z = self.regression_head(geom_features)
-        return F.normalize(predicted_z, p=2, dim=-1)
+        geom = self.encode_points(point_clouds)
+        return F.normalize(self.regression_head(geom),p=2,dim=-1)
+
+    def forward_with_logits(self, point_clouds, text_features, scale=10.0):
+        geom = self.encode_points(point_clouds)
+        prediction = F.normalize(self.regression_head(geom),p=2,dim=-1)
+        logits = (prediction*text_features.unsqueeze(1)).sum(-1)*scale
+        if self.architecture == "query_local":
+            gamma,beta = self.query_film(text_features).chunk(2,dim=-1)
+            conditioned = geom*(1+torch.tanh(gamma).unsqueeze(1))+beta.unsqueeze(1)
+            logits = logits+self.query_head(conditioned).squeeze(-1)
+        return prediction,logits

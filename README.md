@@ -148,3 +148,56 @@ echo "$DIRECTAFFORD_SCREEN"
 脚本顺序执行四组，每组单独保存日志/权重，最后生成 `screen_summary.json`。重启时使用同一个 output-root 自动跳过已完成组并恢复未完成组；修改预算、种子、代码或数据路径必须用新根目录。第二次启动同一筛选根目录会被锁拒绝。测试集不参与筛选。
 
 评估胜出配置之前冻结配置和选择规则，并补齐三种子重复；正式对比需统一测试样本、查询、归一化、点采样和 AUC 汇总方式。任何阈值是否达成最终以该冻结协议下的独立测试结果为准。
+
+
+## 第二阶段：结构对照与验证内校准诊断
+
+第一轮四组50轮筛选没有达到双指标目标。不要将局部结构修改直接当作已验证的性能提升；需要独立重训并在冻结协议下核验。
+
+### 结构变体
+
+`--architecture legacy`（默认）保持旧模型参数键、输出和 checkpoint 兼容。旧几何编码器是本仓库自定义模型，代码并未实际加载 Point-BERT 预训练权重。
+
+`--architecture local` 在区域插值特征之外新增每点坐标和16邻域相对坐标的均值/最大值/最小值，将这12维描述编码到64维，再与384维区域特征融合。目的是检查区域插值是否限制了点级细节表达；不是既有方法已被证明的改进。
+
+`--architecture query_local` 在 local 基础上，将冻结文本特征用于 FiLM 条件调制，再由小型预测头输出残差 logits，与原余弦 logits 相加。它改变了模型结构，是明确标注的实验变体。该分支必须使用含非零 BCE 权重的训练目标。
+
+三组结构对照均使用纯 BCE、种子42、50轮、相同学习率调度和 joint 选优规则，分别为 legacy/local/query_local。不同时改变损失权重，避免把结构作用和损失作用混在一起。局部邻域增加计算和内存开销，真实运行耗时需在 node107 上测量。
+
+### 校准诊断与查询敏感度
+
+`src/evaluate.py --split val --audit-queries` 导出原始概率、标签、查询、shape ID和权重哈希，并报告替换查询后的平均预测变化。这个变化衡量敏感度，不是查询语义正确率。
+
+`scripts/diagnose_calibration.py` 只接受未校准的 LASO 验证集导出，按 shape ID 分成拟合/检查两部分，拟合全局正斜率+偏置的 logit 映射，输出检查部分校准前后 AUC/MAE。默认拟合 MAE，可显式指定 BCE。不会使用测试标签、修改标签或删除困难样本。
+
+**限制：checkpoint 已用完整验证集选优，随后划分的检查部分仍不是独立评估。** 校准诊断只能用于开发探索，不能当作无偏测试成绩。正斜率映射在数学上保持排序，不能提升排序能力；数值饱和可能产生额外平分，所以仍报告实际 AUC而不宣称严格数值不变。
+
+校准 JSON绑定 checkpoint SHA256。正式使用前冻结权重、校准参数和选择协议，再在独立测试集一次性评估；用 `src/evaluate.py --calibration <calibration.json>` 会同时记录原始指标和校准指标，拒绝权重哈希不匹配的文件。
+
+### Node107 一次启动第二阶段
+
+```bash
+cd /data/liwei/DirectAfford-Experiment
+conda activate directafford_env
+export PYTHONNOUSERSITE=1
+git pull --ff-only
+python -m unittest discover -s tests -v
+nvidia-smi
+
+DIRECTAFFORD_STAGE2="outputs/stage2_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$DIRECTAFFORD_STAGE2"
+nohup python -u scripts/run_stage2.py \
+  --source-screen outputs/loss_screen_20261014_041032 \
+  --data-dir data/laso_dataset --gpu 1 --epochs 50 --seed 42 \
+  --output-root "$DIRECTAFFORD_STAGE2" \
+  > "$DIRECTAFFORD_STAGE2/stage2.log" 2>&1 &
+echo "$DIRECTAFFORD_STAGE2"
+```
+
+确认GPU 1可用后启动。管线先对纯BCE/低权重组合的 best_joint 和原权重组合的 best_auc 做验证内校准诊断，再依次训练三种结构。数据、旧权重和代码均记录哈希；只读取 train/val，不评估 test。
+
+输出包括 `stage2_plan.json`、`status.json`、`calibration_diagnostics/`、`structure/` 和最终 `stage2_summary.json`。日志每100 batch更新；保留第一轮全部结果。相同根目录重复启动会被锁拒绝，完整完成后重复调用不会重跑；恢复未完成任务需使用同一目录和冻结配置。
+
+更新代码后不要恢复第一轮旧筛选管线，其源代码哈希已改变。新结构不能从旧几何模型自动续训，必须用新目录训练。现有旧 checkpoint 仍可由默认 legacy 模型严格加载和评估。
+
+本阶段离线测试覆盖旧模型输出/权重兼容、局部和查询分支梯度、实际训练与评估调用、按对象校准划分、拒绝测试集拟合、校准权重绑定，以及第二阶段管线恢复。测试使用固定文本替代CLIP，仅验证语义，不证明真实精度提升。

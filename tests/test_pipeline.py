@@ -1,6 +1,8 @@
 """Offline semantic tests. CLIP downloads are replaced by a fixed text encoder.
 Synthetic fixtures verify plumbing, not real-world model quality.
 """
+import contextlib
+import io
 import importlib
 import json
 import pickle
@@ -57,8 +59,8 @@ import train
 import evaluate
 
 
-def small_model(name="offline"):
-    model = DirectAffordModel(name)
+def small_model(name="offline",architecture="legacy"):
+    model = DirectAffordModel(name,architecture=architecture)
     model.geometric_encoder = AttentionEnhancedGeometricEncoder(num_patches=4,k_neighbors=3,num_layers=1)
     return model
 
@@ -73,6 +75,145 @@ def fixture(base, split, offset=0):
 
 
 class PipelineTests(unittest.TestCase):
+    def setUp(self):
+        # Fixtures test semantics, not achieved accuracy. Keep fake metrics out
+        # of the user-facing unittest output.
+        self.capture=contextlib.redirect_stdout(io.StringIO())
+        self.capture.__enter__()
+
+    def tearDown(self):
+        self.capture.__exit__(None,None,None)
+
+    def test_stage2_pipeline_resumes_without_test_access(self):
+        spec=importlib.util.spec_from_file_location('stage2',Path(__file__).resolve().parents[1]/'scripts/run_stage2.py')
+        stage2=importlib.util.module_from_spec(spec);spec.loader.exec_module(stage2)
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d);data=base/'data';source=base/'source';out=base/'stage2'
+            fixture(data,'train',0);fixture(data,'val',10)
+            (data/'Affordance-Question.csv').write_text('Object,Affordance,Question0\n')
+            for name,file in [('bce','best_joint.pth'),('combined_01','best_joint.pth'),('combined_1','best_auc.pth')]:
+                (source/name).mkdir(parents=True);(source/name/file).write_bytes(b'offline-test-checkpoint')
+            commands=[]
+            def fake_run(command,**kwargs):
+                commands.append(command)
+                script=Path(command[2]).name
+                if script=='evaluate.py':
+                    self.assertEqual(command[command.index('--split')+1],'val')
+                    dest=Path(command[command.index('--output-dir')+1]);dest.mkdir(parents=True)
+                    (dest/'metrics.json').write_text('{}')
+                elif script=='diagnose_calibration.py':
+                    dest=Path(command[command.index('--output-dir')+1]);dest.mkdir(parents=True)
+                    (dest/'diagnostic.json').write_text('{}')
+                elif script=='run_structure_screen.py':
+                    dest=Path(command[command.index('--output-root')+1]);dest.mkdir(parents=True)
+                    (dest/'screen_summary.json').write_text('[]')
+                else: self.fail(script)
+            argv=['stage2.py','--source-screen',str(source),'--data-dir',str(data),'--output-root',str(out)]
+            with patch.object(stage2.subprocess,'run',fake_run),patch.object(sys,'argv',argv):
+                stage2.main();stage2.main()
+            self.assertEqual(len(commands),7)
+            self.assertEqual(json.loads((out/'status.json').read_text())['status'],'complete')
+            self.assertFalse((data/'anno_test.pkl').exists())
+
+    def test_legacy_score_and_checkpoint_compatibility(self):
+        model=small_model(); model.eval()
+        pcs=torch.rand(2,8,3); text=torch.nn.functional.normalize(torch.rand(2,512),dim=-1)
+        with torch.no_grad():
+            embeddings=model(pcs)
+            scored,logits=model.forward_with_logits(pcs,text)
+        torch.testing.assert_close(scored,embeddings,rtol=0,atol=0)
+        torch.testing.assert_close(logits,10*(embeddings*text.unsqueeze(1)).sum(-1))
+        small_model().load_state_dict(model.state_dict(),strict=True)
+        self.assertFalse(any('query_' in k or 'local_fusion' in k for k in model.state_dict()))
+
+    def test_local_and_query_paths_receive_gradients(self):
+        for architecture in ('local','query_local'):
+            model=small_model(architecture=architecture)
+            pcs=torch.rand(2,8,3); text=torch.nn.functional.normalize(torch.rand(2,512),dim=-1)
+            features,logits=model.forward_with_logits(pcs,text)
+            _,bce=loss_components(features,text,torch.tensor([[0,1]*4]*2).float(),logits=logits)
+            bce.backward()
+            self.assertGreater(model.point_local[0].weight.grad.abs().sum().item(),0)
+            if architecture=='query_local':
+                self.assertGreater(model.query_film.weight.grad.abs().sum().item(),0)
+                self.assertGreater(model.query_head[-1].weight.grad.abs().sum().item(),0)
+                model.eval()
+                with torch.no_grad():
+                    f1,l1=model.forward_with_logits(pcs,text)
+                    f2,l2=model.forward_with_logits(pcs,-text)
+                torch.testing.assert_close(f1,f2,rtol=0,atol=0)
+                residual1=l1-10*(f1*text.unsqueeze(1)).sum(-1)
+                residual2=l2-10*(f2*(-text).unsqueeze(1)).sum(-1)
+                self.assertGreater((residual1-residual2).abs().mean().item(),1e-6)
+
+    def test_query_architecture_train_and_evaluate(self):
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d); data=base/'data'; out=base/'run'
+            fixture(data,'train',0); fixture(data,'val',10); fixture(data,'test',20)
+            argv=['train.py','--data-dir',str(data),'--laso-query-mode','affordance',
+                  '--architecture','query_local','--loss','bce','--epochs','1','--device','cpu',
+                  '--batch-size','2','--num-points','8','--output-dir',str(out)]
+            with patch.object(train,'DirectAffordModel',small_model),patch.object(sys,'argv',argv): train.main()
+            eval_args=['evaluate.py','--checkpoint',str(out/'best.pth'),'--data-dir',str(data),
+                       '--device','cpu','--output-dir',str(base/'eval')]
+            with patch.object(evaluate,'DirectAffordModel',small_model),patch.object(sys,'argv',eval_args): evaluate.main()
+            report=json.loads((base/'eval'/'metrics.json').read_text())
+            self.assertEqual(report['architecture'],'query_local')
+            with np.load(base/'eval'/'predictions.npz') as result:
+                self.assertEqual(result['shape_ids'].tolist(),['20','21'])
+
+    def test_calibrated_evaluation_checks_checkpoint_identity(self):
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d); data=base/'data'; run=base/'run'
+            fixture(data,'train',0);fixture(data,'val',10);fixture(data,'test',20)
+            argv=['train.py','--data-dir',str(data),'--laso-query-mode','affordance','--loss','bce',
+                  '--epochs','1','--device','cpu','--num-points','8','--batch-size','2','--output-dir',str(run)]
+            with patch.object(train,'DirectAffordModel',small_model),patch.object(sys,'argv',argv):train.main()
+            from real_data import file_hash
+            calibration=base/'calibration.json'
+            parameters=dict(slope=0.8,bias=-0.5,source_split='val',checkpoint_sha256=file_hash(run/'best.pth'))
+            calibration.write_text(json.dumps(parameters))
+            ev=['evaluate.py','--checkpoint',str(run/'best.pth'),'--data-dir',str(data),'--calibration',str(calibration),
+                '--device','cpu','--output-dir',str(base/'evaluated')]
+            with patch.object(evaluate,'DirectAffordModel',small_model),patch.object(sys,'argv',ev):evaluate.main()
+            report=json.loads((base/'evaluated'/'metrics.json').read_text())
+            self.assertEqual(report['raw_pooled']['auc'],report['pooled']['auc'])
+            self.assertIsNotNone(report['calibration_sha256'])
+            parameters['checkpoint_sha256']='wrong';calibration.write_text(json.dumps(parameters))
+            ev=[str(base/'mismatch') if v==str(base/'evaluated') else v for v in ev]
+            with patch.object(evaluate,'DirectAffordModel',small_model),patch.object(sys,'argv',ev):
+                with self.assertRaises(ValueError):evaluate.main()
+
+    def test_calibration_groups_fit_and_rank(self):
+        from calibration import split_groups,fit_calibration,apply_calibration
+        ids=np.array(['a','a','b','b','c','d'])
+        fit,check=split_groups(ids)
+        self.assertFalse(set(ids[fit]) & set(ids[check]))
+        p=np.array([0.1,0.2,0.3,0.6,0.7,0.8])
+        y=np.array([0,0,1,0,1,1])
+        parameters=fit_calibration(p,y)
+        self.assertLessEqual(parameters['fit_objective'],parameters['identity_objective'])
+        q=apply_calibration(p,0.8,-0.5)
+        np.testing.assert_array_equal(np.argsort(p),np.argsort(q))
+        self.assertEqual(compute_metrics(p,y)['auc'],compute_metrics(q,y)['auc'])
+        with self.assertRaises(ValueError): apply_calibration(p,-1,0)
+
+    def test_calibration_cli_rejects_test_input(self):
+        spec=importlib.util.spec_from_file_location('diagnose',Path(__file__).resolve().parents[1]/'scripts/diagnose_calibration.py')
+        diagnose=importlib.util.module_from_spec(spec); spec.loader.exec_module(diagnose)
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d); data=base/'validation'; out=base/'calibration'; data.mkdir()
+            (data/'metrics.json').write_text(json.dumps(dict(split='val',dataset='laso',checkpoint_sha256='fixture',calibration_sha256=None)))
+            p=np.array([[0.2,0.6]]*6); y=np.array([[0,1]]*6)
+            np.savez(data/'predictions.npz',probabilities=p,masks=y,shape_ids=np.array(['a','a','b','b','c','d']))
+            argv=['diagnose.py','--predictions-dir',str(data),'--output-dir',str(out)]
+            with patch.object(sys,'argv',argv): diagnose.main()
+            parameters=json.loads((out/'calibration.json').read_text())
+            self.assertFalse(set(parameters['fit_shape_ids']) & set(parameters['check_shape_ids']))
+            (data/'metrics.json').write_text(json.dumps(dict(split='test',dataset='laso')))
+            with patch.object(sys,'argv',argv):
+                with self.assertRaises(SystemExit): diagnose.main()
+
     def test_joint_selection_does_not_splice_metrics(self):
         selector=CheckpointSelection()
         selector.update(dict(auc=0.90,mae=0.15))

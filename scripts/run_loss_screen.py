@@ -12,7 +12,8 @@ CANDIDATES=[('alignment','alignment',1.0),('bce','bce',0.0),
             ('combined_01','alignment_bce',0.1),('combined_1','alignment_bce',1.0)]
 
 
-def main():
+def main(candidates=None,study="loss"):
+    candidates = candidates or [(name,mode,weight,"legacy") for name,mode,weight in CANDIDATES]
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--gpu',default='1')
     parser.add_argument('--data-dir',default='data/laso_dataset')
@@ -36,14 +37,14 @@ def main():
         try: fcntl.flock(lock.fileno(),fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: raise SystemExit('This screen is already running')
         plan={'data_dir':str(data),'epochs':args.epochs,'seed':args.seed,'gpu':args.gpu,
-              'data_hashes':data_hashes,'candidates':CANDIDATES,'selection':'joint','scheduler':'plateau',
+              'data_hashes':data_hashes,'study':study,'candidates':candidates,'selection':'joint','scheduler':'plateau',
               'source_hashes':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (repo/'src').glob('*.py')}}
         plan=json.loads(json.dumps(plan))
         plan_path=root/'screen_plan.json'
         if plan_path.exists() and json.loads(plan_path.read_text()) != plan:
             raise SystemExit('Screen configuration/source changed: choose a new output root')
         plan_path.write_text(json.dumps(plan,indent=2))
-        for name,mode,weight in CANDIDATES:
+        for name,mode,weight,architecture in candidates:
             out=root/name
             out.mkdir(exist_ok=True)
             history_path=out/'history.json'
@@ -53,19 +54,19 @@ def main():
             command=[sys.executable,'-u',str(repo/'src/train.py'),'--dataset','laso','--data-dir',str(data),
                      '--device','cuda','--epochs',str(args.epochs),'--seed',str(args.seed),
                      '--batch-size','16','--loss',mode,'--alignment-weight',str(weight),
-                     '--bce-weight','1','--scheduler','plateau','--lr-patience','5',
+                     '--bce-weight','1','--architecture',architecture,'--scheduler','plateau','--lr-patience','5',
                      '--selection','joint','--output-dir',str(out)]
             if (out/'last.pth').exists(): command+=['--resume',str(out/'last.pth')]
             print(json.dumps({'event':'launch','candidate':name,'command':command}),flush=True)
             with open(out/'train.log','a') as log:
                 subprocess.run(command,cwd=repo,env=environment,stdout=log,stderr=subprocess.STDOUT,check=True)
         summaries=[]
-        for name,_,_ in CANDIDATES:
+        for name,_,_,architecture in candidates:
             rows=json.loads((root/name/'history.json').read_text())
             def joint(r):
                 return max(0,0.871-r['auc'])/0.871+max(0,r['mae']-0.089)/0.089 if r['auc'] is not None else float('inf')
             selected=min(rows,key=joint)
-            summaries.append({'candidate':name,'selected_epoch':selected['epoch'],
+            summaries.append({'candidate':name,'architecture':architecture,'selected_epoch':selected['epoch'],
                               'auc':selected['auc'],'mae':selected['mae'],'joint_shortfall':joint(selected),
                               'both_validation_targets_met':selected['auc'] is not None and selected['auc']>0.871 and selected['mae']<0.089,
                               'checkpoint':str(root/name/'best_joint.pth')})

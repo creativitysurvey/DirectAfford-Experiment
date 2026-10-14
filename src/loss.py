@@ -34,10 +34,11 @@ def direct_predictive_alignment_loss(predicted_point_embeddings, target_text_emb
 
 
 
-def loss_components(predicted, target, masks, scale=10.0):
+def loss_components(predicted, target, masks, scale=10.0, logits=None):
     """Expose competing positive-alignment and dense segmentation terms."""
     alignment = direct_predictive_alignment_loss(predicted, target, masks)
-    logits = (predicted * target.unsqueeze(1)).sum(-1) * scale
+    if logits is None:
+        logits = (predicted * target.unsqueeze(1)).sum(-1) * scale
     bce = F.binary_cross_entropy_with_logits(logits, masks.reshape_as(logits))
     return alignment, bce
 

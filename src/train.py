@@ -36,11 +36,11 @@ def build_dataset(args, split, class_mode="seen"):
 
 
 def probabilities(model, pcs, queries, mode, scale):
-    features = model(pcs)
     text = model.get_text_embeddings(queries, pcs.device)
+    features,logits = model.forward_with_logits(pcs,text,scale)
     cosine = (features * text.unsqueeze(1)).sum(-1)
     # Preserve original scoring for the alignment-only ablation.
-    return ((cosine + 1) / 2).clamp(0, 1) if mode == "alignment" else torch.sigmoid(cosine * scale)
+    return ((cosine + 1) / 2).clamp(0, 1) if mode == "alignment" else torch.sigmoid(logits)
 
 
 def validate(model, loader, device, mode, scale):
@@ -79,6 +79,7 @@ def main():
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--architecture",choices=["legacy","local","query_local"],default="legacy")
     parser.add_argument("--loss", choices=["alignment", "bce", "alignment_bce"], default="alignment")
     parser.add_argument("--logit-scale", type=float, default=10.0)
     parser.add_argument("--alignment-weight", type=float, default=1.0)
@@ -103,6 +104,8 @@ def main():
         args.lr_patience < 0 or args.early_stop_patience < 0 or args.log_every < 0 or
         not 0 < args.min_lr <= args.lr):
         parser.error("Invalid weights, targets, patience, log interval or minimum LR")
+    if args.architecture == "query_local" and (args.loss == "alignment" or args.bce_weight <= 0):
+        parser.error("query_local requires a nonzero BCE objective")
     active_weight = (args.alignment_weight if args.loss == "alignment" else args.bce_weight
                      if args.loss == "bce" else args.alignment_weight + args.bce_weight)
     if active_weight <= 0:
@@ -129,7 +132,7 @@ def main():
         output.mkdir(parents=True, exist_ok=True)
         if (output/"last.pth").exists() and not args.resume:
             raise FileExistsError("Existing run: choose a new output directory or --resume")
-        model = DirectAffordModel(args.text_encoder).to(args.device)
+        model = DirectAffordModel(args.text_encoder,architecture=args.architecture).to(args.device)
         # Includes geometric encoder AND regression head. Frozen text parameters excluded.
         optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=1e-4)
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=False)
@@ -151,7 +154,7 @@ def main():
             optimizer.load_state_dict(checkpoint["optimizer"])
             # Old checkpoints may resume only with legacy defaults; historical AUC
             # peaks cannot be reconstructed without their saved model weights.
-            defaults = dict(alignment_weight=1.0,bce_weight=1.0,selection="mae",target_auc=0.871,
+            defaults = dict(architecture="legacy",alignment_weight=1.0,bce_weight=1.0,selection="mae",target_auc=0.871,
                             target_mae=0.089,scheduler="none",lr_patience=5,min_lr=1e-6,early_stop_patience=0)
             for key, default in defaults.items():
                 if checkpoint["config"].get(key,default) != config[key]:
@@ -187,9 +190,9 @@ def main():
             for batch_index, (pcs, masks, queries) in enumerate(train_loader,1):
                 pcs, masks = pcs.to(args.device), masks.to(args.device)
                 optimizer.zero_grad(set_to_none=True)
-                prediction = model(pcs)
                 text = model.get_text_embeddings(queries, args.device)
-                alignment, bce = loss_components(prediction,text,masks,args.logit_scale)
+                prediction,logits = model.forward_with_logits(pcs,text,args.logit_scale)
+                alignment, bce = loss_components(prediction,text,masks,args.logit_scale,logits=logits)
                 loss = (args.alignment_weight*alignment if args.loss == "alignment" else
                         args.bce_weight*bce if args.loss == "bce" else
                         args.alignment_weight*alignment + args.bce_weight*bce)
