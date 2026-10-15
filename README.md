@@ -38,7 +38,7 @@ data/laso_dataset/LASO_dataset/
 - `objects_<split>.pkl`：以 shape ID 为键的 dict，或每条带 `shape_id` 的 list；每个对象是坐标数组或只含一个坐标字段 `point_cloud` / `points` / `coordinate` 的字典。
 - 官方 query 模式（默认）要求标注含 `class`，并按 CSV 的 `Object`/`Affordance` 精确匹配。训练使用 Question1–14 的随机改写，验证/测试使用 Question0；不再把 affordance 类名当成情境问题。`--laso-query-mode affordance` 仅供类名消融，不能称为官方 LASO 查询协议。
 - 坐标为 `(N, >=3)`，取前三列；点与 mask 必须等长且有限。缺失 shape、歧义 query/mask、空点云立即报错。
-- 训练、验证、测试 shape 必须互不重叠；独立测试入口检查训练和验证 shape ID。采样索引按 seed + 标注序号固定，点和 mask 同步；短点云保留原点并重复补足。LASO 坐标按官方流程中心化并缩放到单位球，退化点云报错。full-shape 坐标流程保持原样。不同预处理的基线不可直接混比。
+- 训练、验证、测试 shape 必须互不重叠；独立测试入口检查训练和验证 shape ID。默认采样索引按 seed + 标注序号固定，点和 mask 同步；短点云保留原点并重复补足。可显式启用下述训练逐轮采样增强，验证和测试始终保持固定采样。LASO 坐标按官方流程中心化并缩放到单位球，退化点云报错。full-shape 坐标流程保持原样。不同预处理的基线不可直接混比。
 
 ## 真实数据训练与独立评估
 
@@ -272,3 +272,52 @@ echo "PID=$! 输出目录=$DIRECTAFFORD_QUERY"
 进度看 `status.json`、`stage.log`；同对象结果在 `same_object/diagnostic.json`；探针结果在 `overfit_pooled/diagnostic.json`、`overfit_tokens/diagnostic.json`；正式逐轮日志在 `screen/query_local_bce/train.log` 和 `screen/query_tokens_bce/train.log`。最终 `summary.json` 汇总诊断及选中的完整成对验证指标。所有新输出单独保存，不写入前两阶段目录。根目录加锁，配置/代码/数据/来源权重哈希绑定；同配置重跑跳过已完成诊断，正式训练由筛选脚本续跑，未完成的容量探针需检查后用新目录重跑。
 
 离线检查增加了token屏蔽、有效token影响及梯度、文本冻结、同对象点标签配对、正确/互换查询对照、token模型真实训练与诊断调用，以及管线恢复/配置变更拒绝。使用固定文本替代CLIP；这些检查不证明真实词语语义或GPU精度。
+
+## 第四阶段：训练采样增强与初始学习率的2×2对照
+
+第三阶段用户报告的 query_tokens 最优联合验证结果为第16轮 pooled AUC=0.862926、macro AUC=0.852242、MAE=0.0908485；最低MAE轮次为第25轮，pooled AUC=0.851125、MAE=0.0897259。50轮内未达双指标目标。两种解码器在8个训练对象上的容量探针均可达到约0.989 AUC、0.023 MAE，这只证明能拟合该训练子集，不是泛化成绩。
+
+新增 LASO 训练选项 `--train-sampling fixed|epoch`（默认fixed）和 `--train-keep-ratio`（默认1）。epoch模式的采样随机数由 `[seed, annotation_index, epoch]` 的 SeedSequence生成，与读取顺序和全局随机数无关。每轮开始设置epoch，续跑根据检查点轮次恢复相同采样；采样策略和保留比例加入严格恢复配置检查。旧检查点缺少这两项时按fixed/1兼容。
+
+原始点数若正好等于2048，单纯重新采样/排列不会改变可见点集。因此本轮增强设置为epoch/0.85：先从完整归一化点云中无放回随机保留 `max(1,floor(0.85*N))` 个点，再按原配对采样规则采样或重复补齐到2048。坐标和soft mask始终使用同一索引，不引入噪声标签，不按前景位置选择点，不对稀疏子集重新归一化。增强同时改变了输入覆盖和重复点分布，可能改善也可能损害效果，必须对照验证。epoch/1仍可单独使用，但N等于目标点数时不会改变点集。
+
+验证和测试强制使用fixed/1；训练点增强不会影响评估对象、点数、查询、标签阈值、聚合方式或选优规则。full_shape暂不支持该增强，显式请求会报错。`run.json` 记录原始训练点数范围、恰好等于目标点数的标注数量、增强策略和比例。
+
+四组都从头训练query_tokens，纯BCE、seed42、batch16、2048点、50轮，使用相同plateau调度及原有pooled AUC/MAE联合选优，保留macro AUC。只改变如下两项：
+
+| 目录名 | 训练采样 | 初始学习率 |
+|---|---|---:|
+| fixed_lr1e-4 | 原固定采样 | 0.0001 |
+| epoch85_lr1e-4 | 逐轮85%点保留及配对补足 | 0.0001 |
+| fixed_lr5e-5 | 原固定采样 | 0.00005 |
+| epoch85_lr5e-5 | 逐轮85%点保留及配对补足 | 0.00005 |
+
+固定采样1e-4组用于核验原结果在当前兼容代码下可复现。不要把不同轮次的最佳指标拼接；汇总中的macro AUC也是该选中轮次的指标。目标表的正式协议仍需统一，本轮不通过改变汇总口径来宣称精度提高。
+
+在node107激活环境并通过测试后，确认GPU 1空闲，使用单条启动命令（无需手动设置输出变量）：
+
+```bash
+cd /data/liwei/DirectAfford-Experiment
+conda activate directafford_env
+export PYTHONNOUSERSITE=1
+git pull --ff-only
+python -m unittest discover -s tests -v
+nvidia-smi
+```
+
+```bash
+bash scripts/start_sampling_screen.sh 1 50
+```
+
+启动脚本使用当前Python环境，先检查指定GPU是否可用，再建立唯一的新目录；这不是GPU占用检测，请先查看nvidia-smi。启动后打印PID、绝对输出目录及可以直接复制的日志查看命令。四组顺序占用同一张GPU；不读取test文件，不写入前几轮目录。最终输出 `screen_summary.json`，每组的 `train.log` 每100批次和每轮更新，`history.json` 保留全部轮次；`screen_plan.json` 绑定配置、数据及Python源码哈希。
+
+恢复未完成筛选时使用同一配置、同一根目录直接运行Python入口（不要再次运行启动脚本创建另一个任务）：
+
+```bash
+python -u scripts/run_sampling_screen.py --gpu 1 --epochs 50 --seed 42 \
+  --data-dir data/laso_dataset --output-root <原输出目录>
+```
+
+仅在确认原任务已经退出后恢复。已完成组跳过，未完成组用last.pth恢复；更换配置、数据或代码必须另起目录。更新代码后不要恢复前几阶段冻结过源码哈希的旧管线；原权重和结果继续保留且可评估。
+
+新增检查覆盖逐轮采样确定性、稀疏点与标签配对、验证输入保持固定、增强训练恢复与连续训练的参数完全一致、恢复配置变更拒绝，以及四组命令/已完成组跳过。离线测试通过不代表本轮真实精度已经提升。

@@ -392,6 +392,86 @@ class PipelineTests(unittest.TestCase):
             data=LASORealDataset(d,'val',32,42,query_mode='affordance')
             np.testing.assert_array_equal(data[0][0],data[0][0])
 
+    def test_epoch_thinning_pairing_reproducibility_and_fixed_validation(self):
+        with tempfile.TemporaryDirectory() as d:
+            fixture(Path(d),'train');fixture(Path(d),'val',10)
+            ds=LASORealDataset(d,'train',8,42,'affordance',sampling='epoch',keep_ratio=0.85)
+            ds.set_epoch(1);first=ds[0]
+            ds[1]
+            again=ds[0]
+            np.testing.assert_array_equal(first[0],again[0]);np.testing.assert_array_equal(first[1],again[1])
+            self.assertEqual(len(np.unique(first[0],axis=0)),6)
+            native,mask=ds.samples[0][:2]
+            nearest=((first[0][:,None,:]-native[None,:,:])**2).sum(-1).argmin(-1)
+            np.testing.assert_array_equal(first[0],native[nearest])
+            np.testing.assert_array_equal(first[1],np.asarray(mask)[nearest])
+            ds.set_epoch(2);self.assertFalse(np.array_equal(first[0],ds[0][0]))
+            ds.set_epoch(1);np.testing.assert_array_equal(first[0],ds[0][0])
+            for split in ('train','val'):
+                fixed=LASORealDataset(d,split,6,42,'affordance')
+                fixed.set_epoch(1);a=fixed[0]
+                fixed.set_epoch(2);b=fixed[0]
+                np.testing.assert_array_equal(a[0],b[0]);np.testing.assert_array_equal(a[1],b[1])
+                expected=sample_points(fixed.samples[0][0],fixed.samples[0][1],6,np.random.default_rng(42))
+                np.testing.assert_array_equal(a[0],expected[0])
+            with self.assertRaises(ValueError):LASORealDataset(d,'val',8,42,'affordance',sampling='epoch')
+            with self.assertRaises(ValueError):LASORealDataset(d,'train',8,42,'affordance',keep_ratio=0.85)
+
+    def test_epoch_sampling_resume_matches_uninterrupted_and_evaluates_fixed(self):
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d);data=base/'data';out=base/'run'
+            fixture(data,'train',0);fixture(data,'val',10)
+            common=['train.py','--data-dir',str(data),'--laso-query-mode','affordance',
+                    '--architecture','query_tokens','--loss','bce','--num-points','8','--batch-size','2',
+                    '--train-sampling','epoch','--train-keep-ratio','0.85','--device','cpu','--output-dir',str(out)]
+            with patch.object(train,'DirectAffordModel',small_model),patch.object(sys,'argv',common+['--epochs','1']):train.main()
+            with patch.object(train,'DirectAffordModel',small_model),patch.object(sys,'argv',common+['--epochs','3','--resume',str(out/'last.pth')]):train.main()
+            resumed=torch.load(out/'last.pth',weights_only=False)
+            fresh=[str(base/'fresh') if arg==str(out) else arg for arg in common]+['--epochs','3']
+            with patch.object(train,'DirectAffordModel',small_model),patch.object(sys,'argv',fresh):train.main()
+            reference=torch.load(base/'fresh/last.pth',weights_only=False)
+            for key,tensor in resumed['model'].items():
+                torch.testing.assert_close(tensor,reference['model'][key],rtol=0,atol=0)
+            args=types.SimpleNamespace(**resumed['config'])
+            val=train.build_dataset(args,'val')
+            self.assertEqual(val.sampling,'fixed');self.assertEqual(val.keep_ratio,1)
+            eval_args=['evaluate.py','--checkpoint',str(out/'last.pth'),'--data-dir',str(data),
+                       '--split','val','--device','cpu','--output-dir',str(base/'eval')]
+            with patch.object(evaluate,'DirectAffordModel',small_model),patch.object(sys,'argv',eval_args):evaluate.main()
+            with np.load(base/'eval/predictions.npz') as result:
+                np.testing.assert_array_equal(result['masks'][0],val[0][1])
+            mismatch=[('0.9' if arg=='0.85' else arg) for arg in common]+['--epochs','4','--resume',str(out/'last.pth')]
+            with patch.object(train,'DirectAffordModel',small_model),patch.object(sys,'argv',mismatch):
+                with self.assertRaisesRegex(ValueError,'train_keep_ratio'):train.main()
+
+    def test_sampling_screen_factorial_commands_and_resume(self):
+        sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
+        import run_loss_screen as screen
+        import run_sampling_screen as sampling
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d);data=base/'data';out=base/'screen'
+            fixture(data,'train');fixture(data,'val',10)
+            (data/'Affordance-Question.csv').write_text('fixture')
+            calls=[]
+            def launch(command,**kwargs):
+                calls.append(command)
+                child=Path(command[command.index('--output-dir')+1])
+                (child/'history.json').write_text(json.dumps([dict(epoch=1,auc=0.8,macro_auc=0.81,mae=0.1)]))
+            argv=['run_sampling_screen.py','--data-dir',str(data),'--epochs','1','--output-root',str(out)]
+            with patch.object(screen.subprocess,'run',side_effect=launch),patch.object(sys,'argv',argv):
+                screen.main(sampling.CANDIDATES,'sampling_lr_2x2',sampling.OPTIONS)
+                screen.main(sampling.CANDIDATES,'sampling_lr_2x2',sampling.OPTIONS)
+                self.assertEqual(len(calls),4)
+                changed={k:dict(v) for k,v in sampling.OPTIONS.items()}
+                changed['epoch85_lr1e-4']['train-keep-ratio']=0.9
+                with self.assertRaises(SystemExit):screen.main(sampling.CANDIDATES,'sampling_lr_2x2',changed)
+            configs={(float(c[c.index('--lr')+1]),c[c.index('--train-sampling')+1],
+                      float(c[c.index('--train-keep-ratio')+1])) for c in calls}
+            self.assertEqual(configs,{(1e-4,'fixed',1.),(1e-4,'epoch',.85),(5e-5,'fixed',1.),(5e-5,'epoch',.85)})
+            self.assertTrue(all(c[c.index('--architecture')+1]=='query_tokens' for c in calls))
+            self.assertFalse((data/'anno_test.pkl').exists())
+            self.assertEqual(json.loads((out/'screen_summary.json').read_text())[0]['macro_auc'],0.81)
+
     def test_official_questions_and_normalization(self):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)

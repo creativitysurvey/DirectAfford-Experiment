@@ -28,7 +28,9 @@ def seed_all(seed):
 
 def build_dataset(args, split, class_mode="seen"):
     if args.dataset == "laso":
-        return LASORealDataset(args.data_dir, split, args.num_points, args.seed, args.laso_query_mode)
+        return LASORealDataset(args.data_dir, split, args.num_points, args.seed, args.laso_query_mode,
+                               sampling=getattr(args,"train_sampling","fixed") if split=="train" else "fixed",
+                               keep_ratio=getattr(args,"train_keep_ratio",1.0) if split=="train" else 1.0)
     from dataset import AffordanceNetKFoldDataset
     dataset = AffordanceNetKFoldDataset(args.data_dir, args.fold, split, args.num_points, class_mode)
     dataset.hashes = {str(p.resolve()): file_hash(p) for p in [Path(args.data_dir)/f"full_shape_{split}_data.pkl"]}
@@ -75,6 +77,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-points", type=int, default=2048)
     parser.add_argument("--laso-query-mode", choices=["official", "affordance"], default="official")
+    parser.add_argument("--train-sampling",choices=["fixed","epoch"],default="fixed")
+    parser.add_argument("--train-keep-ratio",type=float,default=1.0)
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -96,6 +100,12 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
+    if not np.isfinite(args.train_keep_ratio) or not 0 < args.train_keep_ratio <= 1:
+        parser.error("train keep ratio must be in (0,1]")
+    if args.train_sampling == "fixed" and args.train_keep_ratio != 1:
+        parser.error("Point thinning requires --train-sampling epoch")
+    if args.dataset != "laso" and (args.train_sampling != "fixed" or args.train_keep_ratio != 1):
+        parser.error("Training sampling options currently support LASO only")
     if min(args.epochs, args.batch_size, args.num_points) <= 0 or args.lr <= 0 or args.logit_scale <= 0:
         parser.error("epochs, batch size, points, learning rate and scale must be positive")
     if (args.alignment_weight < 0 or args.bce_weight < 0 or
@@ -153,7 +163,8 @@ def main():
             optimizer.load_state_dict(checkpoint["optimizer"])
             # Old checkpoints may resume only with legacy defaults; historical AUC
             # peaks cannot be reconstructed without their saved model weights.
-            defaults = dict(architecture="legacy",alignment_weight=1.0,bce_weight=1.0,selection="mae",target_auc=0.871,
+            defaults = dict(architecture="legacy",train_sampling="fixed",train_keep_ratio=1.0,
+                            alignment_weight=1.0,bce_weight=1.0,selection="mae",target_auc=0.871,
                             target_mae=0.089,scheduler="none",lr_patience=5,min_lr=1e-6,early_stop_patience=0)
             for key, default in defaults.items():
                 if checkpoint["config"].get(key,default) != config[key]:
@@ -177,11 +188,20 @@ def main():
                     "train_samples": len(train_dataset), "val_samples": len(val_dataset),
                     "source_hashes": {p.name: file_hash(p) for p in Path(__file__).parent.glob("*.py")},
                     "selection": f"validation {args.selection}; dual and joint checkpoints; no test selection"}
+        if args.dataset == "laso":
+            sizes = [len(s[0]) for s in train_dataset.samples]
+            metadata["training_point_sampling"] = {"policy":args.train_sampling,"keep_ratio":args.train_keep_ratio,
+                "native_min":min(sizes),"native_max":max(sizes),
+                "annotations_with_native_count_equal_num_points":sum(n==args.num_points for n in sizes),
+                "validation":"fixed legacy sampling; no thinning",
+                "augmentation":"epoch thinning, then paired subsample/pad" if args.train_sampling=="epoch" else "none"}
         (output/"run.json").write_text(json.dumps(metadata, indent=2))
         print(json.dumps({"event":"ready","start_epoch":start,"end_epoch":args.epochs,
                           "train_samples":len(train_dataset),"val_samples":len(val_dataset),
                           "output_dir":str(output),"selection":args.selection}),flush=True)
         for epoch in range(start, args.epochs+1):
+            if args.dataset == "laso":
+                train_dataset.set_epoch(epoch)
             epoch_start = time.monotonic()
             lr_used = optimizer.param_groups[0]["lr"]
             model.train()

@@ -38,9 +38,15 @@ def sample_points(points, mask, num_points, rng):
 
 
 class LASORealDataset:
-    def __init__(self, data_dir, split="train", num_points=2048, seed=42, query_mode="official"):
+    def __init__(self, data_dir, split="train", num_points=2048, seed=42, query_mode="official",
+                 sampling="fixed", keep_ratio=1.0):
+        if sampling not in {"fixed", "epoch"} or not np.isfinite(keep_ratio) or not 0 < keep_ratio <= 1:
+            raise ValueError("Invalid training sampling policy")
+        if (split != "train" or sampling == "fixed") and (sampling != "fixed" or keep_ratio != 1):
+            raise ValueError("Epoch sampling/point thinning are training-only; fixed requires keep_ratio=1")
         self.split, self.query_mode = split, query_mode
         self.num_points, self.seed = num_points, seed
+        self.sampling, self.keep_ratio, self.epoch = sampling, keep_ratio, 0
         base = Path(data_dir)
         if (base / "LASO_dataset").is_dir():
             base = base / "LASO_dataset"
@@ -111,10 +117,24 @@ class LASORealDataset:
     def __len__(self):
         return len(self.samples)
 
+    def set_epoch(self, epoch):
+        if not isinstance(epoch, int) or epoch < 0:
+            raise ValueError("epoch must be a nonnegative integer")
+        self.epoch = epoch
+
     def __getitem__(self, index):
         points, mask, query, _, questions = self.samples[index]
         if questions:
             query = questions[np.random.randint(len(questions))] if self.split == "train" else questions[0]
-        # Fixed paired sampling for repeatable train/validation/evaluation inputs.
-        points, mask = sample_points(points, mask, self.num_points, np.random.default_rng(self.seed + index))
+        if self.sampling == "epoch":
+            # Independent of call order/global RNG; restored from epoch on resume.
+            rng = np.random.default_rng(np.random.SeedSequence([self.seed,index,self.epoch]))
+            if self.keep_ratio < 1:
+                keep = max(1,int(len(points)*self.keep_ratio))
+                indices = rng.choice(len(points),keep,replace=False)
+                points, mask = points[indices], np.asarray(mask)[indices]
+            points, mask = sample_points(points,mask,self.num_points,rng)
+        else:
+            # Legacy path stays byte-for-byte reproducible for validation and old runs.
+            points, mask = sample_points(points, mask, self.num_points, np.random.default_rng(self.seed + index))
         return points, mask, query
