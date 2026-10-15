@@ -36,8 +36,7 @@ def build_dataset(args, split, class_mode="seen"):
 
 
 def probabilities(model, pcs, queries, mode, scale):
-    text = model.get_text_embeddings(queries, pcs.device)
-    features,logits = model.forward_with_logits(pcs,text,scale)
+    features,text,logits = model.score_queries(pcs,queries,scale)
     cosine = (features * text.unsqueeze(1)).sum(-1)
     # Preserve original scoring for the alignment-only ablation.
     return ((cosine + 1) / 2).clamp(0, 1) if mode == "alignment" else torch.sigmoid(logits)
@@ -79,7 +78,7 @@ def main():
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--architecture",choices=["legacy","local","query_local"],default="legacy")
+    parser.add_argument("--architecture",choices=["legacy","local","query_local","query_tokens"],default="legacy")
     parser.add_argument("--loss", choices=["alignment", "bce", "alignment_bce"], default="alignment")
     parser.add_argument("--logit-scale", type=float, default=10.0)
     parser.add_argument("--alignment-weight", type=float, default=1.0)
@@ -104,8 +103,8 @@ def main():
         args.lr_patience < 0 or args.early_stop_patience < 0 or args.log_every < 0 or
         not 0 < args.min_lr <= args.lr):
         parser.error("Invalid weights, targets, patience, log interval or minimum LR")
-    if args.architecture == "query_local" and (args.loss == "alignment" or args.bce_weight <= 0):
-        parser.error("query_local requires a nonzero BCE objective")
+    if args.architecture in {"query_local","query_tokens"} and (args.loss == "alignment" or args.bce_weight <= 0):
+        parser.error("Query decoder architectures require a nonzero BCE objective")
     active_weight = (args.alignment_weight if args.loss == "alignment" else args.bce_weight
                      if args.loss == "bce" else args.alignment_weight + args.bce_weight)
     if active_weight <= 0:
@@ -190,8 +189,7 @@ def main():
             for batch_index, (pcs, masks, queries) in enumerate(train_loader,1):
                 pcs, masks = pcs.to(args.device), masks.to(args.device)
                 optimizer.zero_grad(set_to_none=True)
-                text = model.get_text_embeddings(queries, args.device)
-                prediction,logits = model.forward_with_logits(pcs,text,args.logit_scale)
+                prediction,text,logits = model.score_queries(pcs,queries,args.logit_scale)
                 alignment, bce = loss_components(prediction,text,masks,args.logit_scale,logits=logits)
                 loss = (args.alignment_weight*alignment if args.loss == "alignment" else
                         args.bce_weight*bce if args.loss == "bce" else

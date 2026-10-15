@@ -30,7 +30,13 @@ class Tokenizer:
         return cls()
 
     def __call__(self, queries, **kwargs):
-        return TokenBatch(batch=len(queries))
+        ids = torch.zeros(len(queries),4,dtype=torch.long)
+        mask = torch.zeros_like(ids)
+        for i,q in enumerate(queries):
+            words = q.split()[:4] or ['empty']
+            ids[i,:len(words)] = torch.tensor([sum(w.encode())%512 for w in words])
+            mask[i,:len(words)] = 1
+        return TokenBatch(batch=len(queries),input_ids=ids,attention_mask=mask)
 
 
 class TextModel(torch.nn.Module):
@@ -44,8 +50,9 @@ class TextModel(torch.nn.Module):
     def from_pretrained(cls, name):
         return cls()
 
-    def forward(self, batch):
-        return types.SimpleNamespace(pooler_output=self.anchor.unsqueeze(0).expand(batch,-1))
+    def forward(self, batch, input_ids=None, attention_mask=None):
+        tokens = torch.nn.functional.one_hot(input_ids,512).float()
+        return types.SimpleNamespace(pooler_output=self.anchor.unsqueeze(0).expand(batch,-1),last_hidden_state=tokens)
 
 
 # Stub only the external text dependency; exercise actual geometry/head/loss.
@@ -75,6 +82,49 @@ def fixture(base, split, offset=0):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_token_attention_masks_padding_and_uses_words(self):
+        model = small_model(architecture='query_tokens').eval()
+        pcs = torch.randn(2,8,3)
+        pooled = torch.nn.functional.normalize(torch.randn(2,512),dim=-1)
+        tokens = torch.randn(2,4,512)
+        padding = torch.tensor([[False,False,True,True]]*2)
+        with torch.no_grad():
+            _,original = model.forward_with_logits(pcs,pooled,token_features=tokens,token_padding=padding)
+            changed = tokens.clone();changed[:,2:] += 100
+            _,masked = model.forward_with_logits(pcs,pooled,token_features=changed,token_padding=padding)
+            torch.testing.assert_close(original,masked)
+            changed[:,0] *= -1
+            _,valid = model.forward_with_logits(pcs,pooled,token_features=changed,token_padding=padding)
+            self.assertGreater((valid-original).abs().max().item(),1e-6)
+        _,_,logits = model.score_queries(pcs,['grasp handle','open door'])
+        logits.sum().backward()
+        self.assertGreater(model.token_attention.in_proj_weight.grad.abs().sum().item(),0)
+        self.assertTrue(all(p.grad is None for p in model.text_encoder.parameters()))
+        with self.assertRaises(ValueError):
+            model.forward_with_logits(pcs,pooled)
+
+    def test_same_object_pairs_and_direction_diagnostic(self):
+        spec=importlib.util.spec_from_file_location('diagnose_queries',Path(__file__).resolve().parents[1]/'scripts/diagnose_queries.py')
+        diagnostic=importlib.util.module_from_spec(spec);spec.loader.exec_module(diagnostic)
+        points=np.arange(24,dtype=np.float32).reshape(8,3)
+        dataset=types.SimpleNamespace(num_points=6,samples=[
+            (points,[0,1]*4,'grasp','a',['grasp?']),
+            (points,[1,0]*4,'open','a',['open?']),
+            (points,[0,1]*4,'grasp','b',['grasp?'])])
+        pcs,y,queries,pairs,eligible=diagnostic.paired_inputs(dataset,8,42)
+        self.assertEqual(eligible,1)
+        np.testing.assert_array_equal(pcs[0],pcs[1])
+        np.testing.assert_array_equal(y[0],1-y[1])
+        good=diagnostic.query_diagnostic(y,y)
+        self.assertEqual(good['matched_mae'],0)
+        self.assertEqual(good['target_weighted_direction_margin'],1)
+        wrong=diagnostic.query_diagnostic(y[::-1],y)
+        self.assertLess(wrong['swapped_minus_matched_mae'],0)
+        neutral=diagnostic.query_diagnostic(np.full_like(y,0.5),y)
+        self.assertEqual(neutral['mean_prediction_change'],0)
+        dataset.samples=dataset.samples[:1]
+        with self.assertRaises(ValueError):diagnostic.paired_inputs(dataset)
+
     def setUp(self):
         # Fixtures test semantics, not achieved accuracy. Keep fake metrics out
         # of the user-facing unittest output.
@@ -161,6 +211,67 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(report['architecture'],'query_local')
             with np.load(base/'eval'/'predictions.npz') as result:
                 self.assertEqual(result['shape_ids'].tolist(),['20','21'])
+
+    def test_token_training_and_real_diagnostic_paths(self):
+        spec=importlib.util.spec_from_file_location('query_probe',Path(__file__).resolve().parents[1]/'scripts/diagnose_queries.py')
+        diagnostic=importlib.util.module_from_spec(spec);spec.loader.exec_module(diagnostic)
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d);data=base/'data';out=base/'run'
+            for split,offset in [('train',0),('val',10)]:
+                fixture(data,split,offset)
+                path=data/f'anno_{split}.pkl'
+                rows=pickle.loads(path.read_bytes())
+                rows += [{**r,'affordance':'open','mask':[1,0]*4} for r in rows]
+                for r in rows:r['class']='door'
+                path.write_bytes(pickle.dumps(rows))
+            import csv
+            with open(data/'Affordance-Question.csv','w',newline='') as f:
+                writer=csv.DictWriter(f,fieldnames=['Object','Affordance']+[f'Question{i}' for i in range(15)])
+                writer.writeheader()
+                for aff in ['grasp','open']:
+                    writer.writerow({'Object':'door','Affordance':aff,**{f'Question{i}':f'{aff} door {i}?' for i in range(15)}})
+            argv=['train.py','--data-dir',str(data),'--architecture','query_tokens','--loss','bce',
+                  '--epochs','1','--device','cpu','--batch-size','2','--num-points','8','--output-dir',str(out)]
+            with patch.object(train,'DirectAffordModel',small_model),patch.object(sys,'argv',argv):train.main()
+            common=['diagnose_queries.py','--data-dir',str(data),'--device','cpu','--num-points','8','--max-shapes','1','--steps','1']
+            argv=common+['--mode','queries','--checkpoint',str(out/'best.pth'),'--output-dir',str(base/'query')]
+            with patch.object(diagnostic,'DirectAffordModel',small_model),patch.object(sys,'argv',argv):diagnostic.main()
+            report=json.loads((base/'query/diagnostic.json').read_text())
+            self.assertEqual(report['split'],'val')
+            self.assertEqual(report['architecture'],'query_tokens')
+            self.assertEqual(len(report['selected_pairs']),1)
+            argv=common+['--mode','overfit','--architecture','query_tokens','--output-dir',str(base/'probe')]
+            with patch.object(diagnostic,'DirectAffordModel',small_model),patch.object(sys,'argv',argv):diagnostic.main()
+            report=json.loads((base/'probe/diagnostic.json').read_text())
+            self.assertEqual(report['split'],'train')
+            self.assertEqual([r['step'] for r in report['history']],[0,1])
+            self.assertTrue((base/'probe/overfit_probe.pth').exists())
+
+    def test_query_stage_sequential_resume_and_manifest(self):
+        spec=importlib.util.spec_from_file_location('query_stage',Path(__file__).resolve().parents[1]/'scripts/run_query_stage.py')
+        stage=importlib.util.module_from_spec(spec);spec.loader.exec_module(stage)
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d);data=base/'data';source=base/'stage2';out=base/'stage3'
+            fixture(data,'train',0);fixture(data,'val',10)
+            (data/'Affordance-Question.csv').write_text('fixture')
+            source.mkdir();(source/'status.json').write_text('{"status":"complete"}')
+            checkpoint=source/'structure/query_local_bce/best_joint.pth'
+            checkpoint.parent.mkdir(parents=True);checkpoint.write_bytes(b'fixture')
+            def child(command,**kwargs):
+                if Path(command[2]).name=='diagnose_queries.py':
+                    dest=Path(command[command.index('--output-dir')+1]);dest.mkdir()
+                    (dest/'diagnostic.json').write_text('{}')
+                else:
+                    self.assertEqual(Path(command[2]).name,'run_token_screen.py')
+                    dest=Path(command[command.index('--output-root')+1]);dest.mkdir()
+                    (dest/'screen_summary.json').write_text('[]')
+            argv=['run_query_stage.py','--source-stage2',str(source),'--data-dir',str(data),'--output-root',str(out)]
+            with patch.object(stage.subprocess,'run',side_effect=child) as launch,patch.object(sys,'argv',argv):
+                stage.main();self.assertEqual(launch.call_count,4)
+                stage.main();self.assertEqual(launch.call_count,4)
+                checkpoint.write_bytes(b'changed')
+                with self.assertRaises(ValueError):stage.main()
+            self.assertEqual(json.loads((out/'status.json').read_text())['status'],'complete')
 
     def test_calibrated_evaluation_checks_checkpoint_identity(self):
         with tempfile.TemporaryDirectory() as d:

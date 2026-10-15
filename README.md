@@ -234,3 +234,41 @@ echo "PID=$! 输出目录=$DIRECTAFFORD_AUDIT"
 输出在 `results/protocol_audit.json`，逐个验证的日志在 `results/*.log`。使用新目录，禁止写入已完成的第二阶段目录；失败保留日志，再运行需新目录。审计不修改已有权重、历史、标签或阈值。校准导出和test导出会被拒绝。该工具对应的定向离线检查为 `python -m unittest discover -s tests -p test_protocol_audit.py -v`。
 
 用户提供的截图包含 Point-BERT(0.871/0.136)、OpenAD(0.870/0.089)、LASO(0.858/0.098)、DirectAfford(0.860/0.092)。这些只是待核验的参考数值，截图未证明数据划分、模型权重、预处理和评估脚本一致。目标仍是冻结协议下同一模型同时 AUC>0.871、MAE<0.089；不得通过更换指标汇总方式来宣称模型精度提高。几何预训练仍未接入，当前自定义编码器与官方 Point-BERT权重不兼容，不能用 `strict=False` 把部分键加载成功视为完成预训练复现。
+
+## 第三阶段：词级查询解码与同对象诊断
+
+第二阶段已运行的三组联合选优结果（用户提供，种子42、验证集）为：legacy 0.8264/0.1040、local 0.8236/0.1018、query_local 0.8300/0.0994（pooled AUC/MAE），均未达标。协议审计中 query_local 的逐样本平均 AUC 为0.8363，MAE仍为0.0994。单一查询向量可能限制功能词与部位词的使用，这是待验证假设，不是已证明的瓶颈。
+
+新增 `--architecture query_tokens`：保留 query_local 的局部特征、池化查询调制和余弦分支，在预测头前加入点特征到冻结 CLIP 最后一层文本 token 的6头交叉注意力、残差归一化和前馈层。padding token 被屏蔽，文本仍冻结。仅支持含非零 BCE 的目标；它是实验变体，不是官方 LASO 或 Point-BERT 复现。旧模型参数键与评分保持兼容，默认仍为 legacy。新变体需要从头训练，不将旧 checkpoint 部分加载冒充新结构训练。
+
+`scripts/diagnose_queries.py` 提供两个用途：
+
+- `--mode queries --checkpoint ...`：只读验证集。按 shape 找到不同 affordance、不同 mask 的查询对，每个对象选全点 mask 差异最大的一个对；最多128个对象。两条查询使用完全相同的坐标、点索引，并比较正确查询与互换查询对应预测的 MAE。报告正确查询误差更低的对象比例、互换前后 MAE 差及标签差异加权的预测方向。相比替换成任意别的查询，这个诊断能检验同一对象内的功能区分。它依然只描述这组特选样本，不能代表全验证集精度。
+- `--mode overfit --architecture query_local|query_tokens`：只读训练集，固定最多8个对象的双功能查询及对应问题（Question1），分别从头训练300步。报告训练子集初始/最终 MAE、AUC与功能区分指标，作为容量和梯度诊断；不读取验证或测试，不是泛化成绩。输出的 `overfit_probe.pth` 明确标为诊断权重，不能当作正式训练 checkpoint。没有可用同对象双功能标注会报错，不捏造替代对。
+
+配对采样按 shape ID哈希和种子确定，双查询共用点索引；它与正式验证逐标注采样不同。因此诊断分数不能与完整验证指标直接比较。单个对象的完整 mask 平均差必须>0.01才纳入，记录候选对象数量、选中标注索引、问题及采样后差异，不用预测成绩选择对象。
+
+`scripts/run_query_stage.py` 一次顺序执行：已有 query_local 最优联合模型的同对象验证诊断、query_local 和 query_tokens 两个训练子集容量探针、两种结构各50轮的纯BCE配对训练。最后一步保持已有 pooled AUC/MAE联合选优及 plateau 调度，不因审计结果切换选优口径；同时保留每轮 macro AUC。容量诊断不设未经验证的自动过关阈值，正式两组都执行。目标是否达到仍须冻结配置后三种子重复与独立测试，不保证本轮胜出。
+
+```bash
+cd /data/liwei/DirectAfford-Experiment
+conda activate directafford_env
+export PYTHONNOUSERSITE=1
+git pull --ff-only
+python -m unittest discover -s tests -v
+nvidia-smi
+
+# 确认GPU 1空闲后，只启动一次。
+DIRECTAFFORD_QUERY="outputs/query_stage_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$DIRECTAFFORD_QUERY"
+nohup python -u scripts/run_query_stage.py \
+  --source-stage2 outputs/stage2_20261014_103937 \
+  --data-dir data/laso_dataset --gpu 1 --epochs 50 --probe-steps 300 --seed 42 \
+  --output-root "$DIRECTAFFORD_QUERY" \
+  > "$DIRECTAFFORD_QUERY/stage.log" 2>&1 &
+echo "PID=$! 输出目录=$DIRECTAFFORD_QUERY"
+```
+
+进度看 `status.json`、`stage.log`；同对象结果在 `same_object/diagnostic.json`；探针结果在 `overfit_pooled/diagnostic.json`、`overfit_tokens/diagnostic.json`；正式逐轮日志在 `screen/query_local_bce/train.log` 和 `screen/query_tokens_bce/train.log`。最终 `summary.json` 汇总诊断及选中的完整成对验证指标。所有新输出单独保存，不写入前两阶段目录。根目录加锁，配置/代码/数据/来源权重哈希绑定；同配置重跑跳过已完成诊断，正式训练由筛选脚本续跑，未完成的容量探针需检查后用新目录重跑。
+
+离线检查增加了token屏蔽、有效token影响及梯度、文本冻结、同对象点标签配对、正确/互换查询对照、token模型真实训练与诊断调用，以及管线恢复/配置变更拒绝。使用固定文本替代CLIP；这些检查不证明真实词语语义或GPU精度。

@@ -85,7 +85,7 @@ class AttentionEnhancedGeometricEncoder(nn.Module):
 
 class DirectAffordModel(nn.Module):
     def __init__(self, text_encoder_name="openai/clip-vit-base-patch32", architecture="legacy"):
-        if architecture not in {"legacy", "local", "query_local"}:
+        if architecture not in {"legacy", "local", "query_local", "query_tokens"}:
             raise ValueError("Unknown architecture")
         super().__init__()
         self.architecture = architecture
@@ -111,10 +111,17 @@ class DirectAffordModel(nn.Module):
             self.point_local = nn.Sequential(nn.Linear(12,64),nn.GELU(),nn.Linear(64,64))
             self.local_fusion = nn.Sequential(nn.Linear(self.geom_dim+64,self.geom_dim),
                                               nn.LayerNorm(self.geom_dim),nn.GELU())
-        if architecture == "query_local":
+        if architecture in {"query_local", "query_tokens"}:
             self.query_film = nn.Linear(self.text_dim,2*self.geom_dim)
             self.query_head = nn.Sequential(nn.Linear(self.geom_dim,128),nn.GELU(),
                                              nn.Linear(128,1))
+        if architecture == "query_tokens":
+            self.token_projection = nn.Linear(self.text_dim,self.geom_dim)
+            self.token_attention = nn.MultiheadAttention(self.geom_dim,6,dropout=0,batch_first=True)
+            self.token_norm = nn.LayerNorm(self.geom_dim)
+            self.token_ffn = nn.Sequential(nn.Linear(self.geom_dim,512),nn.GELU(),
+                                            nn.Linear(512,self.geom_dim))
+            self.token_output_norm = nn.LayerNorm(self.geom_dim)
 
     def train(self, mode=True):
         super().train(mode)
@@ -126,6 +133,21 @@ class DirectAffordModel(nn.Module):
             inputs = self.tokenizer(text_queries, padding=True, return_tensors="pt", truncation=True).to(device)
             text_features = self.text_encoder(**inputs).pooler_output
             return F.normalize(text_features, p=2, dim=-1)
+
+    def score_queries(self, point_clouds, queries, scale=10.0):
+        """One text encoding; token context is only consumed by the new variant."""
+        if self.architecture != "query_tokens":
+            text = self.get_text_embeddings(queries,point_clouds.device)
+            prediction,logits = self.forward_with_logits(point_clouds,text,scale)
+        else:
+            with torch.no_grad():
+                inputs = self.tokenizer(queries,padding=True,return_tensors="pt",truncation=True).to(point_clouds.device)
+                encoded = self.text_encoder(**inputs)
+                text = F.normalize(encoded.pooler_output,p=2,dim=-1)
+                tokens = encoded.last_hidden_state
+                padding = ~inputs["attention_mask"].bool()
+            prediction,logits = self.forward_with_logits(point_clouds,text,scale,tokens,padding)
+        return prediction,text,logits
 
     def encode_points(self, point_clouds):
         geom = self.geometric_encoder(point_clouds)
@@ -144,12 +166,22 @@ class DirectAffordModel(nn.Module):
         geom = self.encode_points(point_clouds)
         return F.normalize(self.regression_head(geom),p=2,dim=-1)
 
-    def forward_with_logits(self, point_clouds, text_features, scale=10.0):
+    def forward_with_logits(self, point_clouds, text_features, scale=10.0, token_features=None, token_padding=None):
         geom = self.encode_points(point_clouds)
         prediction = F.normalize(self.regression_head(geom),p=2,dim=-1)
         logits = (prediction*text_features.unsqueeze(1)).sum(-1)*scale
-        if self.architecture == "query_local":
+        if self.architecture in {"query_local", "query_tokens"}:
             gamma,beta = self.query_film(text_features).chunk(2,dim=-1)
             conditioned = geom*(1+torch.tanh(gamma).unsqueeze(1))+beta.unsqueeze(1)
+            if self.architecture == "query_tokens":
+                if token_features is None or token_padding is None:
+                    raise ValueError("query_tokens needs token context; use score_queries")
+                if token_padding.all(dim=1).any():
+                    raise ValueError("Text context must contain at least one valid token")
+                context = self.token_projection(token_features)
+                attention,_ = self.token_attention(conditioned,context,context,
+                                                    key_padding_mask=token_padding,need_weights=False)
+                conditioned = self.token_norm(conditioned+attention)
+                conditioned = self.token_output_norm(conditioned+self.token_ffn(conditioned))
             logits = logits+self.query_head(conditioned).squeeze(-1)
         return prediction,logits
