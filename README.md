@@ -201,3 +201,36 @@ echo "$DIRECTAFFORD_STAGE2"
 更新代码后不要恢复第一轮旧筛选管线，其源代码哈希已改变。新结构不能从旧几何模型自动续训，必须用新目录训练。现有旧 checkpoint 仍可由默认 legacy 模型严格加载和评估。
 
 本阶段离线测试覆盖旧模型输出/权重兼容、局部和查询分支梯度、实际训练与评估调用、按对象校准划分、拒绝测试集拟合、校准权重绑定，以及第二阶段管线恢复。测试使用固定文本替代CLIP，仅验证语义，不证明真实精度提升。
+
+## 第二阶段完成后的评估协议审计
+
+官方来源固定为 [LASO c412ec3 的 eval_lyc.py](https://github.com/yl3800/LASO/blob/c412ec376310fd9d2de0d3ea06516dea50b9d4e8/eval_lyc.py) 和 [数据加载器](https://github.com/yl3800/LASO/blob/c412ec376310fd9d2de0d3ea06516dea50b9d4e8/data_utils/shapenetpart.py)。官方先按样本计算 AUC，再按样本汇总；标签用 `>=0.5`。当前训练选优使用 pooled AUC、标签 `>0.5`，不能把两种 AUC 混比。MAE始终用原始软标签。官方评估还进行3次模型投票，加载器直接使用对象的全部点；当前模型评估使用固定采样且一次预测。审计仅对同一份预测重新汇总，不声称完整复现官方协议。
+
+`scripts/audit_protocol.py` 不训练、不拟合校准、不读取测试集。它读取已完成第二阶段的验证导出及三组完整历史，输出两种标签阈值下的 pooled/macro AUC、相同软标签 MAE、单类样本数、恰好0.5的标签点数和文件哈希。若样本没有正类或负类，AUC为未定义；审计显式计数并计算有定义样本的平均值。官方脚本在这类样本上可能产生NaN或报错，因此只有全部样本均有两类时，才能认为汇总规则对应。
+
+历史汇总同时给出最高 pooled AUC、最高已有 strict macro AUC 和最低 MAE各自的完整轮次。最高 macro 对应轮次可能没有保存权重，不能把日志当作可独立评估的checkpoint。原训练及选优规则保持不变。
+
+先运行无需GPU的历史/已有预测审计：
+
+```bash
+python scripts/audit_protocol.py \
+  --stage2-root outputs/stage2_20261014_103937 \
+  --output-dir "outputs/protocol_cpu_$(date +%Y%m%d_%H%M%S)"
+```
+
+确认GPU 1空闲后，可用一次命令顺序导出三组结构的 `best_joint.pth` 和 `best_auc.pth`，同时审计第一轮已有的三份验证预测。相同权重哈希只推理一次，最多6次结构验证，不重训：
+
+```bash
+DIRECTAFFORD_AUDIT="outputs/protocol_audit_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$DIRECTAFFORD_AUDIT"
+nohup python -u scripts/audit_protocol.py \
+  --stage2-root outputs/stage2_20261014_103937 \
+  --export-structures --data-dir data/laso_dataset --gpu 1 \
+  --output-dir "$DIRECTAFFORD_AUDIT/results" \
+  > "$DIRECTAFFORD_AUDIT/audit.log" 2>&1 &
+echo "PID=$! 输出目录=$DIRECTAFFORD_AUDIT"
+```
+
+输出在 `results/protocol_audit.json`，逐个验证的日志在 `results/*.log`。使用新目录，禁止写入已完成的第二阶段目录；失败保留日志，再运行需新目录。审计不修改已有权重、历史、标签或阈值。校准导出和test导出会被拒绝。该工具对应的定向离线检查为 `python -m unittest discover -s tests -p test_protocol_audit.py -v`。
+
+用户提供的截图包含 Point-BERT(0.871/0.136)、OpenAD(0.870/0.089)、LASO(0.858/0.098)、DirectAfford(0.860/0.092)。这些只是待核验的参考数值，截图未证明数据划分、模型权重、预处理和评估脚本一致。目标仍是冻结协议下同一模型同时 AUC>0.871、MAE<0.089；不得通过更换指标汇总方式来宣称模型精度提高。几何预训练仍未接入，当前自定义编码器与官方 Point-BERT权重不兼容，不能用 `strict=False` 把部分键加载成功视为完成预训练复现。
