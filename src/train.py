@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from model import DirectAffordModel
-from loss import loss_components
+from loss import loss_components, point_pair_ranking_loss
 from selection import CheckpointSelection
 from metrics import compute_metrics
 from real_data import LASORealDataset, file_hash
@@ -87,6 +87,8 @@ def main():
     parser.add_argument("--logit-scale", type=float, default=10.0)
     parser.add_argument("--alignment-weight", type=float, default=1.0)
     parser.add_argument("--bce-weight", type=float, default=1.0)
+    parser.add_argument("--ranking-weight",type=float,default=0.0)
+    parser.add_argument("--ranking-points",type=int,default=64)
     parser.add_argument("--selection", choices=["mae", "auc", "joint"], default="mae")
     parser.add_argument("--target-auc", type=float, default=0.871)
     parser.add_argument("--target-mae", type=float, default=0.089)
@@ -100,6 +102,10 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
+    if not np.isfinite(args.ranking_weight) or args.ranking_weight<0 or not 1<=args.ranking_points<=1024:
+        parser.error("Ranking weight must be finite/nonnegative and sample budget in [1,1024]")
+    if args.ranking_weight and (args.loss=='alignment' or args.bce_weight<=0):
+        parser.error("Ranking experiment requires a nonzero BCE objective")
     if not np.isfinite(args.train_keep_ratio) or not 0 < args.train_keep_ratio <= 1:
         parser.error("train keep ratio must be in (0,1]")
     if args.train_sampling == "fixed" and args.train_keep_ratio != 1:
@@ -164,6 +170,7 @@ def main():
             # Old checkpoints may resume only with legacy defaults; historical AUC
             # peaks cannot be reconstructed without their saved model weights.
             defaults = dict(architecture="legacy",train_sampling="fixed",train_keep_ratio=1.0,
+                            ranking_weight=0.0,ranking_points=64,
                             alignment_weight=1.0,bce_weight=1.0,selection="mae",target_auc=0.871,
                             target_mae=0.089,scheduler="none",lr_patience=5,min_lr=1e-6,early_stop_patience=0)
             for key, default in defaults.items():
@@ -187,6 +194,10 @@ def main():
         metadata = {"config": config, "data_hashes": hashes, "torch": torch.__version__, "numpy": np.__version__,
                     "train_samples": len(train_dataset), "val_samples": len(val_dataset),
                     "source_hashes": {p.name: file_hash(p) for p in Path(__file__).parent.glob("*.py")},
+                    "ranking": {"enabled":args.ranking_weight>0,"positive_rule":">0.5",
+                                "scope":"within each query; mean over queries with two classes",
+                                "rng":"private seed+epoch*1000003+batch_index; global RNG untouched",
+                                "mae_targets":"original soft masks; never binarized"},
                     "selection": f"validation {args.selection}; dual and joint checkpoints; no test selection"}
         if args.dataset == "laso":
             sizes = [len(s[0]) for s in train_dataset.samples]
@@ -205,7 +216,7 @@ def main():
             epoch_start = time.monotonic()
             lr_used = optimizer.param_groups[0]["lr"]
             model.train()
-            total, align_total, bce_total, count = 0.0, 0.0, 0.0, 0
+            total, align_total, bce_total, rank_total, count = 0.0, 0.0, 0.0, 0.0, 0
             for batch_index, (pcs, masks, queries) in enumerate(train_loader,1):
                 pcs, masks = pcs.to(args.device), masks.to(args.device)
                 optimizer.zero_grad(set_to_none=True)
@@ -214,6 +225,12 @@ def main():
                 loss = (args.alignment_weight*alignment if args.loss == "alignment" else
                         args.bce_weight*bce if args.loss == "bce" else
                         args.alignment_weight*alignment + args.bce_weight*bce)
+                ranking = None
+                if args.ranking_weight:
+                    rank_rng = torch.Generator(device=logits.device)
+                    rank_rng.manual_seed(args.seed+epoch*1_000_003+batch_index)
+                    ranking = point_pair_ranking_loss(logits,masks,args.ranking_points,rank_rng)
+                    loss = loss+args.ranking_weight*ranking
                 if not torch.isfinite(loss):
                     raise ValueError("Nonfinite loss")
                 loss.backward()
@@ -221,13 +238,15 @@ def main():
                 total += loss.item()*len(pcs)
                 align_total += alignment.item()*len(pcs)
                 bce_total += bce.item()*len(pcs)
+                rank_total += ranking.item()*len(pcs) if ranking is not None else 0.0
                 count += len(pcs)
                 if args.log_every and batch_index % args.log_every == 0:
                     print(json.dumps({"event":"batch","epoch":epoch,"batch":batch_index,
                           "batches":len(train_loader),"train_loss":total/count}),flush=True)
             metrics = validate(model, val_loader, args.device, args.loss, args.logit_scale)
             row = {"epoch": epoch, "train_loss": total/count,"alignment_loss":align_total/count,
-                   "bce_loss":bce_total/count,"lr":lr_used,"seconds":time.monotonic()-epoch_start,
+                   "bce_loss":bce_total/count,"ranking_loss":rank_total/count,
+                   "lr":lr_used,"seconds":time.monotonic()-epoch_start,
                    "validation_targets_met":metrics["auc"] is not None and metrics["auc"] > args.target_auc and metrics["mae"] < args.target_mae,**metrics}
             history.append(row)
             improved = selector.update(metrics)

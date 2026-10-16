@@ -18,7 +18,7 @@ def main(candidates=None,study="loss",candidate_options=None):
     if set(candidate_options)-{c[0] for c in candidates}:
         raise ValueError('Options refer to unknown candidates')
     for options in candidate_options.values():
-        if set(options)-{'lr','train-sampling','train-keep-ratio'}:
+        if set(options)-{'lr','train-sampling','train-keep-ratio','ranking-weight','ranking-points'}:
             raise ValueError('Unsupported candidate option')
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--gpu',default='1')

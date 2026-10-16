@@ -321,3 +321,44 @@ python -u scripts/run_sampling_screen.py --gpu 1 --epochs 50 --seed 42 \
 仅在确认原任务已经退出后恢复。已完成组跳过，未完成组用last.pth恢复；更换配置、数据或代码必须另起目录。更新代码后不要恢复前几阶段冻结过源码哈希的旧管线；原权重和结果继续保留且可评估。
 
 新增检查覆盖逐轮采样确定性、稀疏点与标签配对、验证输入保持固定、增强训练恢复与连续训练的参数完全一致、恢复配置变更拒绝，以及四组命令/已完成组跳过。离线测试通过不代表本轮真实精度已经提升。
+
+## 第五阶段：小权重点对排序与校准诊断
+
+第四阶段用户报告四组均完成50轮，未有同轮pooled AUC>0.871且MAE<0.089。epoch85/1e-4的最高AUC轮次为21（pooled=0.865447、macro=0.853802、MAE=0.0905007）；最低MAE轮次为40（pooled=0.849173、MAE=0.0881460），不能将两轮最佳值拼接。降低初始学习率没有超过高学习率增强组的最高AUC。
+
+新增 `--ranking-weight`（默认0）与 `--ranking-points`（默认64，范围1–1024）。在含BCE的目标上加入每个查询内部的逻辑排序项：以 `mask>0.5` 为正、其余为负，从各类均匀无放回抽取最多64点，计算所有抽中正负对的 `softplus(-(logit_positive-logit_negative))` 平均值，再平均本批有两类的查询。只含一类的查询不产生排序梯度，但仍参与BCE。BCE和MAE继续使用原soft mask，不改标签或评价阈值。
+
+排序点采样使用独立的设备随机数生成器，种子为 `seed+epoch*1000003+batch_index`，不消耗模型dropout、数据顺序的全局随机数；续跑可按轮次/批次重建。权重为0时完全跳过排序计算，保留原BCE控制流程。新参数写入检查点并严格检查恢复配置；旧检查点按0/64兼容。每轮额外记录 `ranking_loss`，总训练损失为原BCE加权项加上 `ranking_weight*ranking_loss`。
+
+该损失只直接鼓励同一查询内排序，不能保证改善跨查询pooled AUC，也不保证改善MAE。它是实验变体，不是已达标方法。仍沿用原pooled AUC/MAE联合选优及plateau调度，并报告同一选中轮次的macro AUC，不切换汇总方式以制造提升。
+
+本轮固定query_tokens、epoch/0.85点增强、初始学习率1e-4、BCE权重1、seed42、batch16、50轮，仅比较排序权重：
+
+| 组名 | 排序权重 | 每类最多抽样点数 |
+|---|---:|---:|
+| bce_control | 0 | 不执行 |
+| rank002 | 0.02 | 64 |
+| rank005 | 0.05 | 64 |
+
+`scripts/run_ranking_stage.py` 首先对来源筛选目录的 `epoch85_lr1e-4/best_auc.pth` 做完整验证导出，再按既有shape分组校准流程拟合MAE并报告检查部分前后指标，然后依次训练上述三组。校准只作用于旧权重的诊断，不混入新模型训练或三组选优。由于原检查点已用完整val选优，校准检查部分仍是开发探索，不能算独立测试证据；正斜率校准不能补足排序能力差距。
+
+在node107更新并通过测试、确认GPU 1空闲后启动一次：
+
+```bash
+cd /data/liwei/DirectAfford-Experiment
+conda activate directafford_env
+export PYTHONNOUSERSITE=1
+git -c http.version=HTTP/1.1 pull --ff-only
+python -m unittest discover -s tests -v
+nvidia-smi
+```
+
+```bash
+bash scripts/start_ranking_stage.sh outputs/sampling_lr_20261015_074922_YeISsj 1 50
+```
+
+单命令启动器会校验来源文件和CUDA环境，创建唯一新目录并打印PID、输出路径和日志命令。它不检测GPU占用，因此仍须查看nvidia-smi。所有步骤顺序运行，不读取test、不写入原筛选目录。输出包括 `status.json`、`stage.log`、`validation_export/`、`calibration/diagnostic.json`、`screen/<组名>/train.log`，以及最终 `summary.json`。其中 `screen/screen_summary.json` 只包含三组新模型未校准的验证结果，`summary.json` 另外保留旧权重的探索校准诊断。
+
+根目录文件锁防止同目录重复写入；`plan.json` 绑定原权重、来源汇总、train/val数据和Python源码哈希。原进程退出后，恢复时用相同配置、相同output-root直接调用Python入口；不要重复使用启动器生成另一个任务。已完成步骤跳过，部分导出需检查后换新目录，训练由筛选脚本的last.pth恢复。修改代码或参数需新目录；既有权重和结果继续保留。
+
+离线检查覆盖排序项解析值/梯度方向、0.5阈值、单类查询零梯度、独立随机数、soft mask不变、零权重跳过、排序训练恢复与连续训练完全一致、旧无排序配置检查点兼容，以及来源校准/三组配置/完成步骤跳过。它们使用合成小数据和固定文本替代CLIP，不证明真实效果。

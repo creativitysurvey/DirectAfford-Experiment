@@ -1,6 +1,35 @@
 import torch
 import torch.nn.functional as F
 
+
+def point_pair_ranking_loss(logits, masks, points_per_class=64, generator=None):
+    """Per-query logistic ranking, positives >0.5, negatives <=0.5.
+
+    Uniformly sample up to K points per class without replacement, average all
+    sampled positive/negative pairs, then average queries with both classes.
+    Single-class queries contribute no ranking gradient; BCE still trains them.
+    A private generator keeps this sampling separate from model/dropout RNG.
+    """
+    if logits.ndim != 2 or logits.shape != masks.shape or not logits.numel():
+        raise ValueError("Ranking expects matching nonempty [batch, points] tensors")
+    if not isinstance(points_per_class,int) or not 1 <= points_per_class <= 1024:
+        raise ValueError("Ranking sample budget must be an integer in [1,1024]")
+    if not torch.isfinite(logits).all() or not torch.isfinite(masks).all() or ((masks<0)|(masks>1)).any():
+        raise ValueError("Invalid logits or soft targets")
+    terms = []
+    for scores,target in zip(logits,masks):
+        positive = torch.nonzero(target>0.5,as_tuple=True)[0]
+        negative = torch.nonzero(target<=0.5,as_tuple=True)[0]
+        if not positive.numel() or not negative.numel():
+            continue
+        if positive.numel()>points_per_class:
+            positive = positive[torch.randperm(positive.numel(),device=logits.device,generator=generator)[:points_per_class]]
+        if negative.numel()>points_per_class:
+            negative = negative[torch.randperm(negative.numel(),device=logits.device,generator=generator)[:points_per_class]]
+        differences = scores[positive].unsqueeze(1)-scores[negative].unsqueeze(0)
+        terms.append(F.softplus(-differences).mean())
+    return torch.stack(terms).mean() if terms else logits.sum()*0.0
+
 def direct_predictive_alignment_loss(predicted_point_embeddings, target_text_embeddings, point_masks):
     """
     严格按照论文 Equation (VI.1) 和 Algorithm 2 实现的 Direct Predictive Loss。

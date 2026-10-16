@@ -58,7 +58,7 @@ class TextModel(torch.nn.Module):
 # Stub only the external text dependency; exercise actual geometry/head/loss.
 sys.modules['transformers'] = types.SimpleNamespace(CLIPTextModel=TextModel, CLIPTokenizer=Tokenizer)
 from model import DirectAffordModel, AttentionEnhancedGeometricEncoder
-from loss import dense_alignment_loss, loss_components
+from loss import dense_alignment_loss, loss_components, point_pair_ranking_loss
 from selection import CheckpointSelection
 from metrics import compute_metrics
 from real_data import LASORealDataset, sample_points
@@ -82,6 +82,114 @@ def fixture(base, split, offset=0):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_pair_ranking_formula_gradients_and_single_class(self):
+        scores=torch.tensor([[3.,0.],[9.,-4.]],requires_grad=True)
+        targets=torch.tensor([[1.,0.],[0.,0.]])
+        value=point_pair_ranking_loss(scores,targets)
+        torch.testing.assert_close(value,torch.nn.functional.softplus(torch.tensor(-3.)))
+        value.backward()
+        self.assertLess(scores.grad[0,0].item(),0)
+        self.assertGreater(scores.grad[0,1].item(),0)
+        torch.testing.assert_close(scores.grad[1],torch.zeros(2))
+        # A soft target exactly .5 is negative under the frozen training rule.
+        half=point_pair_ranking_loss(torch.tensor([[0.,3.]]),torch.tensor([[.5,.8]]))
+        torch.testing.assert_close(value.detach(),half)
+        empty=torch.randn(2,4,requires_grad=True)
+        zero=point_pair_ranking_loss(empty,torch.ones_like(empty))
+        zero.backward();torch.testing.assert_close(empty.grad,torch.zeros_like(empty))
+        self.assertEqual(zero.item(),0)
+        bad=point_pair_ranking_loss(torch.tensor([[0.,3.]]),torch.tensor([[1.,0.]]))
+        self.assertGreater(bad.item(),value.item())
+        for x,y,k in [(torch.zeros(2,3),torch.zeros(2,4),2),
+                      (torch.tensor([[float('nan')]]),torch.zeros(1,1),2),
+                      (torch.zeros(1,1),torch.ones(1,1)*2,2),
+                      (torch.zeros(1,1),torch.ones(1,1),0)]:
+            with self.assertRaises(ValueError):point_pair_ranking_loss(x,y,k)
+
+    def test_ranking_rng_is_private_and_repeatable(self):
+        scores=torch.linspace(-3,3,128).reshape(1,-1).requires_grad_()
+        targets=torch.tensor([[0.,1.]*64]);before=targets.clone()
+        state=torch.get_rng_state().clone()
+        first=point_pair_ranking_loss(scores,targets,8,torch.Generator().manual_seed(91))
+        second=point_pair_ranking_loss(scores,targets,8,torch.Generator().manual_seed(91))
+        torch.testing.assert_close(first,second,rtol=0,atol=0)
+        torch.testing.assert_close(torch.get_rng_state(),state,rtol=0,atol=0)
+        torch.testing.assert_close(targets,before,rtol=0,atol=0)
+        first.backward();self.assertTrue(torch.isfinite(scores.grad).all())
+
+    def test_ranking_resume_and_zero_weight_compatibility(self):
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d);data=base/'data';out=base/'rank'
+            fixture(data,'train');fixture(data,'val',10)
+            common=['train.py','--data-dir',str(data),'--laso-query-mode','affordance','--device','cpu',
+                    '--architecture','query_tokens','--loss','bce','--num-points','8','--batch-size','2',
+                    '--train-sampling','epoch','--train-keep-ratio','0.85',
+                    '--ranking-weight','0.02','--ranking-points','2','--output-dir',str(out)]
+            with patch.object(train,'DirectAffordModel',small_model),patch.object(sys,'argv',common+['--epochs','1']):train.main()
+            with patch.object(train,'DirectAffordModel',small_model),patch.object(sys,'argv',common+['--epochs','3','--resume',str(out/'last.pth')]):train.main()
+            resumed=torch.load(out/'last.pth',weights_only=False)
+            fresh=[str(base/'fresh') if arg==str(out) else arg for arg in common]+['--epochs','3']
+            with patch.object(train,'DirectAffordModel',small_model),patch.object(sys,'argv',fresh):train.main()
+            reference=torch.load(base/'fresh/last.pth',weights_only=False)
+            for key,tensor in resumed['model'].items():
+                torch.testing.assert_close(tensor,reference['model'][key],rtol=0,atol=0)
+            row=resumed['history'][-1]
+            self.assertGreater(row['ranking_loss'],0)
+            self.assertAlmostEqual(row['train_loss'],row['bce_loss']+.02*row['ranking_loss'],places=6)
+            mismatch=[('0.05' if arg=='0.02' else arg) for arg in common]+['--epochs','4','--resume',str(out/'last.pth')]
+            with patch.object(train,'DirectAffordModel',small_model),patch.object(sys,'argv',mismatch):
+                with self.assertRaisesRegex(ValueError,'ranking_weight'):train.main()
+            zero=[('0' if arg=='0.02' else str(base/'zero') if arg==str(out) else arg) for arg in common]+['--epochs','1']
+            with patch.object(train,'DirectAffordModel',small_model),patch.object(train,'point_pair_ranking_loss') as rank,patch.object(sys,'argv',zero):
+                train.main();rank.assert_not_called()
+            ev=['evaluate.py','--checkpoint',str(out/'best.pth'),'--data-dir',str(data),'--split','val',
+                '--device','cpu','--output-dir',str(base/'eval')]
+            with patch.object(evaluate,'DirectAffordModel',small_model),patch.object(sys,'argv',ev):evaluate.main()
+            self.assertTrue((base/'eval/metrics.json').exists())
+
+    def test_ranking_stage_steps_and_frozen_configuration(self):
+        spec=importlib.util.spec_from_file_location('ranking_stage',Path(__file__).resolve().parents[1]/'scripts/run_ranking_stage.py')
+        stage=importlib.util.module_from_spec(spec);spec.loader.exec_module(stage)
+        sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
+        import run_ranking_screen as ranking
+        import run_loss_screen as screen
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d);data=base/'data';source=base/'source';out=base/'stage'
+            fixture(data,'train');fixture(data,'val',10)
+            (data/'Affordance-Question.csv').write_text('fixture')
+            source.mkdir();(source/'screen_summary.json').write_text('[]')
+            checkpoint=source/'epoch85_lr1e-4/best_auc.pth'
+            checkpoint.parent.mkdir();checkpoint.write_bytes(b'fixture')
+            calls=[]
+            def child(command,**kwargs):
+                calls.append(command);script=Path(command[2]).name
+                if script=='evaluate.py':
+                    self.assertEqual(command[command.index('--split')+1],'val')
+                    dest=Path(command[command.index('--output-dir')+1]);dest.mkdir()
+                    (dest/'metrics.json').write_text('{}')
+                elif script=='diagnose_calibration.py':
+                    dest=Path(command[command.index('--output-dir')+1]);dest.mkdir()
+                    (dest/'diagnostic.json').write_text('{}')
+                elif script=='run_ranking_screen.py':
+                    dest=Path(command[command.index('--output-root')+1]);dest.mkdir()
+                    (dest/'screen_summary.json').write_text('[]')
+                else:
+                    dest=Path(command[command.index('--output-dir')+1])
+                    (dest/'history.json').write_text(json.dumps([{'epoch':1,'auc':.8,'mae':.1,'macro_auc':.81}]))
+            argv=['run_ranking_stage.py','--source-screen',str(source),'--data-dir',str(data),'--output-root',str(out),'--epochs','1']
+            with patch.object(stage.subprocess,'run',side_effect=child),patch.object(sys,'argv',argv):
+                stage.main();stage.main();self.assertEqual(len(calls),3)
+                checkpoint.write_bytes(b'changed')
+                with self.assertRaises(ValueError):stage.main()
+            calls.clear()
+            argv=['run_ranking_screen.py','--data-dir',str(data),'--output-root',str(base/'screen'),'--epochs','1']
+            with patch.object(screen.subprocess,'run',side_effect=child),patch.object(sys,'argv',argv):
+                screen.main(ranking.CANDIDATES,'ranking',ranking.OPTIONS)
+            self.assertEqual(len(calls),3)
+            self.assertEqual({float(c[c.index('--ranking-weight')+1]) for c in calls},{0.,.02,.05})
+            self.assertTrue(all(c[c.index('--train-keep-ratio')+1]=='0.85' for c in calls))
+            self.assertFalse((data/'anno_test.pkl').exists())
+
     def test_token_attention_masks_padding_and_uses_words(self):
         model = small_model(architecture='query_tokens').eval()
         pcs = torch.randn(2,8,3)
@@ -521,6 +629,9 @@ class PipelineTests(unittest.TestCase):
             fixture(data,'train',0); fixture(data,'val',10); fixture(data,'test',20)
             common=['train.py','--laso-query-mode','affordance','--data-dir',str(data),'--num-points','8','--batch-size','2','--device','cpu','--loss','bce','--scheduler','plateau','--lr-patience','0','--selection','joint','--output-dir',str(out)]
             with patch.object(train,'DirectAffordModel',small_model), patch.object(sys,'argv',common+['--epochs','1']): train.main()
+            old=torch.load(out/'last.pth',weights_only=False)
+            old['config'].pop('ranking_weight');old['config'].pop('ranking_points')
+            torch.save(old,out/'last.pth')  # previous version has no ranking options
             with patch.object(train,'DirectAffordModel',small_model), patch.object(sys,'argv',common+['--epochs','3','--resume',str(out/'last.pth')]): train.main()
             checkpoint=torch.load(out/'last.pth',weights_only=False)
             self.assertEqual(checkpoint['epoch'],3)
