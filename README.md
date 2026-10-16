@@ -362,3 +362,32 @@ bash scripts/start_ranking_stage.sh outputs/sampling_lr_20261015_074922_YeISsj 1
 根目录文件锁防止同目录重复写入；`plan.json` 绑定原权重、来源汇总、train/val数据和Python源码哈希。原进程退出后，恢复时用相同配置、相同output-root直接调用Python入口；不要重复使用启动器生成另一个任务。已完成步骤跳过，部分导出需检查后换新目录，训练由筛选脚本的last.pth恢复。修改代码或参数需新目录；既有权重和结果继续保留。
 
 离线检查覆盖排序项解析值/梯度方向、0.5阈值、单类查询零梯度、独立随机数、soft mask不变、零权重跳过、排序训练恢复与连续训练完全一致、旧无排序配置检查点兼容，以及来源校准/三组配置/完成步骤跳过。它们使用合成小数据和固定文本替代CLIP，不证明真实效果。
+
+## 第六阶段：排序权重0.05/0.10/0.20对照
+
+第五阶段用户报告：rank005的最高AUC检查点为第16轮，完整验证pooled AUC=0.8696506、macro AUC=0.8627657、MAE=0.0901295；联合最优为第23轮，pooled AUC=0.8658017、MAE=0.0887870，均未同时满足目标。第16轮同一权重的shape分组校准诊断在596个检查样本上将MAE从0.0918335降至0.0884063，pooled AUC仍为0.8662401；它是验证内探索结果，不与完整val的AUC拼接。
+
+本轮只改变排序权重，预设为0.05、0.10、0.20。其余保持query_tokens、BCE权重1、epoch/0.85点增强、初始LR=1e-4、ranking-points=64、seed42、batch16、2048点、相同50轮预算、plateau调度和原pooled AUC/MAE联合选优。每组从头训练，rank005用于复核上轮对照，不从第50轮继续。三组分别保存为rank005、rank010、rank020，汇总同时列出选中轮次macro AUC。排序权重越大不保证越好，本轮不改变模型、排序定义、标签阈值或评估采样。
+
+本轮不重复已完成的旧权重校准，也不将校准参数用于新模型训练/选优；原校准文件和结果保留。三组只使用train/val，筛选后再决定种子43/44复核和冻结独立测试协议。
+
+```bash
+cd /data/liwei/DirectAfford-Experiment
+conda activate directafford_env
+export PYTHONNOUSERSITE=1
+git -c http.version=HTTP/1.1 pull --ff-only
+python -m unittest discover -s tests -v
+nvidia-smi
+```
+
+确认GPU 1空闲且测试通过后，单独启动一次：
+
+```bash
+bash scripts/start_ranking_strength_screen.sh 1 50
+```
+
+启动器自动创建 `outputs/ranking_strength_<时间>_<唯一后缀>/`，打印PID、绝对路径和日志命令。三组顺序运行，最终结果为根目录 `screen_summary.json`，逐轮进度为 `rank005/train.log`、`rank010/train.log`、`rank020/train.log`；原阶段目录保持不变。
+
+需要恢复时先确认原进程退出，再用相同根目录与冻结配置运行 `python -u scripts/run_ranking_strength_screen.py --gpu 1 --epochs 50 --seed 42 --data-dir data/laso_dataset --output-root <原目录>`；筛选脚本使用文件锁，跳过已完成组，从last.pth恢复未完成组，拒绝配置/代码/数据变化。不要重复使用启动器创建多个任务。
+
+新增定向检查核验三组真实生成命令只改变排序权重、固定采样增强/LR/排序点数/模型/选优配置、已完成组跳过和配置变化拒绝；沿用已有排序梯度与恢复检查。

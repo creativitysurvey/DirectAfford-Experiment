@@ -82,6 +82,36 @@ def fixture(base, split, offset=0):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_ranking_strength_screen_changes_only_weight(self):
+        sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
+        import run_ranking_strength_screen as strength
+        import run_loss_screen as screen
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d);data=base/'data';out=base/'screen'
+            fixture(data,'train');fixture(data,'val',10)
+            (data/'Affordance-Question.csv').write_text('fixture')
+            calls=[]
+            def launch(command,**kwargs):
+                calls.append(command)
+                dest=Path(command[command.index('--output-dir')+1])
+                (dest/'history.json').write_text(json.dumps([{'epoch':1,'auc':.8,'macro_auc':.79,'mae':.1}]))
+            argv=['run_ranking_strength_screen.py','--data-dir',str(data),'--output-root',str(out),'--epochs','1']
+            with patch.object(screen.subprocess,'run',side_effect=launch),patch.object(sys,'argv',argv):
+                screen.main(strength.CANDIDATES,'ranking_strength',strength.OPTIONS)
+                screen.main(strength.CANDIDATES,'ranking_strength',strength.OPTIONS)
+                self.assertEqual(len(calls),3)
+                changed={key:dict(value) for key,value in strength.OPTIONS.items()}
+                changed['rank020']['ranking-weight']=.3
+                with self.assertRaises(SystemExit):screen.main(strength.CANDIDATES,'ranking_strength',changed)
+            self.assertEqual({float(c[c.index('--ranking-weight')+1]) for c in calls},{.05,.1,.2})
+            for c in calls:
+                for flag,value in [('--architecture','query_tokens'),('--loss','bce'),('--ranking-points','64'),
+                                   ('--train-sampling','epoch'),('--train-keep-ratio','0.85'),
+                                   ('--lr','0.0001'),('--seed','42'),('--selection','joint')]:
+                    self.assertEqual(c[c.index(flag)+1],value)
+            self.assertFalse((data/'anno_test.pkl').exists())
+            self.assertEqual(len(json.loads((out/'screen_summary.json').read_text())),3)
+
     def test_pair_ranking_formula_gradients_and_single_class(self):
         scores=torch.tensor([[3.,0.],[9.,-4.]],requires_grad=True)
         targets=torch.tensor([[1.,0.],[0.,0.]])
